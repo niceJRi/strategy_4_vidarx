@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",                      // Use ES Modules
+    "moduleResolution": "bundler",          // Use bundler resolution for ESM
+    "lib": ["ESNext", "dom"],               // Include modern JS features and DOM types
+    "types": ["node"],                      // Add Node.js type definitions
+    "esModuleInterop": true,                // Interoperability with CommonJS modules
+    "declaration": true,                    // Emit declaration files
+    "removeComments": true,                 // Strip comments in output files
+    "emitDecoratorMetadata": true,          // Support metadata for decorators
+    "experimentalDecorators": true,         // Enable decorators (common in NestJS)
+    "allowSyntheticDefaultImports": true,   // Import CommonJS modules with default imports
+    "target": "ESNext",                     // Use latest JavaScript features
+    "sourceMap": true,                      // Generate source maps
+    "outDir": "./dist",                     // Output directory for compiled files
+    "baseUrl": "./",                        // Base directory for resolving modules
+    "incremental": true,                    // Enable incremental builds for faster compilation
+    "skipLibCheck": true,                   // Skip type checks for library files
+    "strictNullChecks": false,              // Allow `null` and `undefined` to be assigned
+    "noImplicitAny": false,                 // Allow `any` type implicitly
+    "strictBindCallApply": false,           // Disable strict bind/call/apply checks
+    "forceConsistentCasingInFileNames": true, // Enforce consistent casing in module names
+    "noFallthroughCasesInSwitch": true,      // Prevent unintended fallthrough in `switch` cases
+    "resolveJsonModule": true,               // Enable importing JSON files as modules
+    "paths": {
+      "@src/*": ["src/*"]
+    }
+  },
+  "ts-node": {
+    "experimentalSpecifierResolution": "node", // Enable ESM-style resolution
+    "transpileOnly": true,                     // Faster compilation without type-checking
+    "esm": true                                // Enable ESM in ts-node
+  },
+  "exclude": ["node_modules", "dist"],        // Exclude unnecessary folders
+  "include": ["src/**/*.ts", "test/**/*.ts"]  // Include source and test files
+}
