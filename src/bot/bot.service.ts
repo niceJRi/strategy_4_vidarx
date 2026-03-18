@@ -28,25 +28,32 @@ export class BotService {
   private maxCount = 3; // can't buy baseSize * 2 ** maxCount
   private strategy = 4;
   private st4Config: Strategy4Config = {
-    enabled: true,
-    tradeWindowStartSec: 300,
-    hardStopSec: 12,
-    cooldownMs: 3000,
-    maxTradesPerMarket: 4,
-    maxMarketExposureUsdc: 60,
-    maxTradeUsdc: 20,
-    minTradeUsdc: 3,
-    maxBudgetFractionPerTrade: 0.35,
-    minPriceGap: 0.12,
-    strongPriceGap: 0.22,
-    maxCombinedAsk: 0.985,
-    hedgeOnlyBelowPrice: 0.34,
-    hedgeCombinedCap: 0.965,
-    minLeaderShare: 0.68,
-    maxLeaderShare: 0.86,
-    maxOneSideExposurePct: 0.78,
-    slippageBuffer: 0.02,
-  };
+  enabled: true,
+  tradeWindowStartSec: 285,
+  hardStopSec: 8,
+  cooldownMs: 500,
+  maxTradesPerMarket: 18,
+  maxMarketExposureUsdc: 120,
+  maxTradeUsdc: 12,
+  minTradeUsdc: 2,
+  maxBudgetFractionPerTrade: 0.15,
+  minPriceGap: 0.02,
+  strongPriceGap: 0.10,
+  maxCombinedAsk: 1.04,
+  hedgeOnlyBelowPrice: 0.42,
+  hedgeCombinedCap: 1.02,
+  minLeaderShare: 0.56,
+  maxLeaderShare: 0.74,
+  maxOneSideExposurePct: 0.66,
+  slippageBuffer: 0.00,
+
+  // new
+  maxAvgPairPrice: 0.98,
+  maxSideSpentUsdc: 72,
+  rebalanceBand: 0.07,
+  starterTradeUsdc: 4,
+  minOppositeSeedPrice: 0.35,
+};
   private preOrdersCreated = new Map<string, boolean>();
   private isMerging = new Map<string, boolean>();
 
@@ -250,6 +257,12 @@ export class BotService {
       st4MaxLeaderShare: 'maxLeaderShare',
       st4MaxOneSideExposurePct: 'maxOneSideExposurePct',
       st4SlippageBuffer: 'slippageBuffer',
+
+      st4MaxAvgPairPrice: 'maxAvgPairPrice',
+      st4MaxSideSpentUsdc: 'maxSideSpentUsdc',
+      st4RebalanceBand: 'rebalanceBand',
+      st4StarterTradeUsdc: 'starterTradeUsdc',
+      st4MinOppositeSeedPrice: 'minOppositeSeedPrice'
     };
 
     for (const [inputKey, configKey] of Object.entries(mapping)) {

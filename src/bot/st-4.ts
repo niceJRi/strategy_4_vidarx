@@ -22,6 +22,13 @@ export type Strategy4Config = {
   maxLeaderShare: number;
   maxOneSideExposurePct: number;
   slippageBuffer: number;
+
+  // new fields
+  maxAvgPairPrice: number;
+  maxSideSpentUsdc: number;
+  rebalanceBand: number;
+  starterTradeUsdc: number;
+  minOppositeSeedPrice: number;
 };
 
 type MarketState = {
@@ -32,6 +39,17 @@ type MarketState = {
   sharesDown: number;
   lastActionAt: number;
   closed: boolean;
+};
+
+type CandidatePlan = {
+  buyUpUsdc: number;
+  buyDownUsdc: number;
+  projectedAvgUp: number;
+  projectedAvgDown: number;
+  projectedPairAvg: number;
+  projectedUpShare: number;
+  score: number;
+  reason: string;
 };
 
 const marketState = new Map<string, MarketState>();
@@ -136,6 +154,77 @@ function getAcceptedOrder(response: any) {
     response.status === 'matched' ||
     response.accepted === true
   );
+}
+
+function calcAvgPrice(spentUsdc: number, shares: number): number {
+  if (shares <= 0) return 0;
+  return spentUsdc / shares;
+}
+
+function calcProjectedMetrics(params: {
+  state: MarketState;
+  upBuyUsdc: number;
+  downBuyUsdc: number;
+  upAsk: number;
+  downAsk: number;
+}) {
+  const { state, upBuyUsdc, downBuyUsdc, upAsk, downAsk } = params;
+
+  const upBuyShares = upBuyUsdc > 0 && upAsk > 0 ? upBuyUsdc / upAsk : 0;
+  const downBuyShares = downBuyUsdc > 0 && downAsk > 0 ? downBuyUsdc / downAsk : 0;
+
+  const nextSpentUp = state.spentUpUsdc + upBuyUsdc;
+  const nextSpentDown = state.spentDownUsdc + downBuyUsdc;
+  const nextSharesUp = state.sharesUp + upBuyShares;
+  const nextSharesDown = state.sharesDown + downBuyShares;
+
+  const projectedAvgUp = calcAvgPrice(nextSpentUp, nextSharesUp);
+  const projectedAvgDown = calcAvgPrice(nextSpentDown, nextSharesDown);
+
+  let projectedPairAvg: number;
+  if (nextSharesUp > 0 && nextSharesDown > 0) {
+    projectedPairAvg = projectedAvgUp + projectedAvgDown;
+  } else if (nextSharesUp > 0) {
+    projectedPairAvg = projectedAvgUp + downAsk;
+  } else if (nextSharesDown > 0) {
+    projectedPairAvg = projectedAvgDown + upAsk;
+  } else {
+    projectedPairAvg = Infinity;
+  }
+
+  const nextTotalSpent = nextSpentUp + nextSpentDown;
+  const projectedUpShare = nextTotalSpent > 0 ? nextSpentUp / nextTotalSpent : 0.5;
+
+  return {
+    nextSpentUp,
+    nextSpentDown,
+    nextSharesUp,
+    nextSharesDown,
+    projectedAvgUp,
+    projectedAvgDown,
+    projectedPairAvg,
+    projectedUpShare,
+  };
+}
+
+function candidateScore(params: {
+  targetUpShare: number;
+  projectedUpShare: number;
+  projectedPairAvg: number;
+  buyUpUsdc: number;
+  buyDownUsdc: number;
+}) {
+  const {
+    targetUpShare,
+    projectedUpShare,
+    projectedPairAvg,
+    buyUpUsdc,
+    buyDownUsdc,
+  } = params;
+
+  const splitError = Math.abs(targetUpShare - projectedUpShare);
+  const totalBuy = buyUpUsdc + buyDownUsdc;
+  return totalBuy * 10 - splitError * 20 - projectedPairAvg * 2;
 }
 
 async function submitBuy(params: {
@@ -422,16 +511,8 @@ export async function main(
     config.minLeaderShare +
     (config.maxLeaderShare - config.minLeaderShare) * gapStrength;
 
-  if (combinedAsk > 1.0) {
+  if (combinedAsk > config.hedgeCombinedCap) {
     leaderShare = Math.min(leaderShare, 0.72);
-  }
-
-  const hedgeCheapEnough =
-    hedgeCheap(upAsk, downAsk, signalDirection, config.hedgeOnlyBelowPrice) &&
-    combinedAsk <= config.hedgeCombinedCap;
-
-  if (hedgeCheapEnough) {
-    leaderShare = Math.min(leaderShare, 0.68);
   }
 
   leaderShare = clamp(leaderShare, config.minLeaderShare, config.maxLeaderShare);
@@ -445,92 +526,112 @@ export async function main(
     targetUpShare = 0.5;
   }
 
-  if (combinedAsk > 1.0) {
-    targetUpShare = clamp(targetUpShare, 0.30, 0.70);
-  }
-
   const currentUpShare = totalSpent > 0 ? state.spentUpUsdc / totalSpent : 0.5;
-  const currentDownShare = 1 - currentUpShare;
-  const targetDownShare = 1 - targetUpShare;
-
   const upNeed = targetUpShare - currentUpShare;
-  const downNeed = targetDownShare - currentDownShare;
 
-  const upBias = Math.max(0, upNeed);
-  const downBias = Math.max(0, downNeed);
+  let desiredUpUsdc = 0;
+  let desiredDownUsdc = 0;
 
-  let upWeight = upBias;
-  let downWeight = downBias;
-
-  if (upWeight === 0 && downWeight === 0) {
-    if (signalDirection > 0) {
-      upWeight = 0.55;
-      downWeight = hedgeCheapEnough ? 0.45 : 0.20;
-    } else if (signalDirection < 0) {
-      downWeight = 0.55;
-      upWeight = hedgeCheapEnough ? 0.45 : 0.20;
-    } else {
-      upWeight = 0.5;
-      downWeight = 0.5;
-    }
+  if (Math.abs(upNeed) <= config.rebalanceBand) {
+    desiredUpUsdc = round6(maxTradeBudget * 0.5);
+    desiredDownUsdc = round6(maxTradeBudget * 0.5);
+  } else if (upNeed > 0) {
+    desiredUpUsdc = round6(maxTradeBudget * clamp(0.5 + upNeed, 0.55, 0.85));
+    desiredDownUsdc = round6(maxTradeBudget - desiredUpUsdc);
+  } else {
+    desiredDownUsdc = round6(maxTradeBudget * clamp(0.5 + Math.abs(upNeed), 0.55, 0.85));
+    desiredUpUsdc = round6(maxTradeBudget - desiredDownUsdc);
   }
 
-  const totalWeight = upWeight + downWeight;
-  if (totalWeight <= 0) {
-    logSkip(logger, timestamp, marketSlug, 'zero_weights');
-    return;
+  const sideCap = Math.min(
+    config.maxSideSpentUsdc,
+    config.maxMarketExposureUsdc * config.maxOneSideExposurePct,
+  );
+
+  const candidates: CandidatePlan[] = [];
+
+  function tryCandidate(buyUpUsdc: number, buyDownUsdc: number, reason: string) {
+    buyUpUsdc = round6(Math.max(0, buyUpUsdc));
+    buyDownUsdc = round6(Math.max(0, buyDownUsdc));
+
+    const nextSpentUp = state.spentUpUsdc + buyUpUsdc;
+    const nextSpentDown = state.spentDownUsdc + buyDownUsdc;
+
+    if (nextSpentUp > sideCap + 1e-9) return;
+    if (nextSpentDown > sideCap + 1e-9) return;
+    if (buyUpUsdc + buyDownUsdc > remainingBudget + 1e-9) return;
+
+    const metrics = calcProjectedMetrics({
+      state,
+      upBuyUsdc: buyUpUsdc,
+      downBuyUsdc: buyDownUsdc,
+      upAsk,
+      downAsk,
+    });
+
+    if (metrics.projectedPairAvg > config.maxAvgPairPrice) return;
+
+    const totalBuy = buyUpUsdc + buyDownUsdc;
+    if (totalBuy < config.minTradeUsdc) return;
+
+    candidates.push({
+      buyUpUsdc,
+      buyDownUsdc,
+      projectedAvgUp: metrics.projectedAvgUp,
+      projectedAvgDown: metrics.projectedAvgDown,
+      projectedPairAvg: metrics.projectedPairAvg,
+      projectedUpShare: metrics.projectedUpShare,
+      score: candidateScore({
+        targetUpShare,
+        projectedUpShare: metrics.projectedUpShare,
+        projectedPairAvg: metrics.projectedPairAvg,
+        buyUpUsdc,
+        buyDownUsdc,
+      }),
+      reason,
+    });
   }
 
-  let upUsdc = round6(maxTradeBudget * (upWeight / totalWeight));
-  let downUsdc = round6(maxTradeBudget * (downWeight / totalWeight));
+  // main balanced/dynamic candidate
+  tryCandidate(desiredUpUsdc, desiredDownUsdc, 'dynamic_main');
 
-  const oneSideCapUsdc = config.maxMarketExposureUsdc * config.maxOneSideExposurePct;
-  const upRemainingCap = Math.max(0, oneSideCapUsdc - state.spentUpUsdc);
-  const downRemainingCap = Math.max(0, oneSideCapUsdc - state.spentDownUsdc);
+  // up only
+  tryCandidate(maxTradeBudget, 0, 'up_only');
 
-  upUsdc = Math.min(upUsdc, upRemainingCap, remainingBudget);
-  downUsdc = Math.min(downUsdc, downRemainingCap, Math.max(0, remainingBudget - upUsdc));
+  // down only
+  tryCandidate(0, maxTradeBudget, 'down_only');
 
-  const plannedTotal = round6(upUsdc + downUsdc);
+  // cheap missing-side seed
+  if (state.spentUpUsdc === 0 && upAsk <= config.minOppositeSeedPrice) {
+    tryCandidate(config.starterTradeUsdc, 0, 'seed_up');
+  }
 
-  if (plannedTotal < config.minTradeUsdc) {
+  if (state.spentDownUsdc === 0 && downAsk <= config.minOppositeSeedPrice) {
+    tryCandidate(0, config.starterTradeUsdc, 'seed_down');
+  }
+
+  if (candidates.length === 0) {
     logSkip(
       logger,
       timestamp,
       marketSlug,
-      'planned_total_low',
-      `planned=${fmt3(plannedTotal)} minTrade=${fmt3(config.minTradeUsdc)}`,
+      'no_valid_candidate',
+      `combined=${fmt3(combinedAsk)} targetUp=${fmt3(targetUpShare)} currentUp=${fmt3(currentUpShare)} avgUp=${fmt3(calcAvgPrice(state.spentUpUsdc, state.sharesUp))} avgDown=${fmt3(calcAvgPrice(state.spentDownUsdc, state.sharesDown))}`,
     );
     return;
   }
 
-  if (upUsdc > 0 && upUsdc < config.minTradeUsdc) {
-    if (plannedTotal >= config.minTradeUsdc * 2) {
-      upUsdc = config.minTradeUsdc;
-      downUsdc = round6(plannedTotal - upUsdc);
-    } else {
-      upUsdc = 0;
-    }
-  }
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
 
-  if (downUsdc > 0 && downUsdc < config.minTradeUsdc) {
-    if (plannedTotal >= config.minTradeUsdc * 2) {
-      downUsdc = config.minTradeUsdc;
-      upUsdc = round6(plannedTotal - downUsdc);
-    } else {
-      downUsdc = 0;
-    }
-  }
+  let buyUpUsdc = best.buyUpUsdc;
+  let buyDownUsdc = best.buyDownUsdc;
 
-  const finalTotal = round6(upUsdc + downUsdc);
-  if (finalTotal < config.minTradeUsdc) {
-    logSkip(
-      logger,
-      timestamp,
-      marketSlug,
-      'final_total_low',
-      `final=${fmt3(finalTotal)} minTrade=${fmt3(config.minTradeUsdc)}`,
-    );
+  if (buyUpUsdc > 0 && buyUpUsdc < config.minTradeUsdc) buyUpUsdc = 0;
+  if (buyDownUsdc > 0 && buyDownUsdc < config.minTradeUsdc) buyDownUsdc = 0;
+
+  if (buyUpUsdc + buyDownUsdc < config.minTradeUsdc) {
+    logSkip(logger, timestamp, marketSlug, 'final_total_low');
     return;
   }
 
@@ -539,7 +640,7 @@ export async function main(
     timestamp,
     marketSlug,
     'PLAN',
-    `up=${fmt3(upAsk)} down=${fmt3(downAsk)} combined=${fmt3(combinedAsk)} gap=${fmt3(gap)} left=${fmt1(timeLeftSec)}s signal=${fmt3(signalDirection)} targetUp=${fmt3(targetUpShare)} currentUp=${fmt3(currentUpShare)} buyUp=${fmt3(upUsdc)} buyDown=${fmt3(downUsdc)} remaining=${fmt3(remainingBudget)}`,
+    `reason=${best.reason} up=${fmt3(upAsk)} down=${fmt3(downAsk)} combined=${fmt3(combinedAsk)} gap=${fmt3(gap)} left=${fmt1(timeLeftSec)}s targetUp=${fmt3(targetUpShare)} currentUp=${fmt3(currentUpShare)} buyUp=${fmt3(buyUpUsdc)} buyDown=${fmt3(buyDownUsdc)} projAvgUp=${fmt3(best.projectedAvgUp)} projAvgDown=${fmt3(best.projectedAvgDown)} projPair=${fmt3(best.projectedPairAvg)}`,
   );
 
   const orders: Array<{
@@ -549,21 +650,21 @@ export async function main(
     usdc: number;
   }> = [];
 
-  if (upUsdc >= config.minTradeUsdc) {
+  if (buyUpUsdc >= config.minTradeUsdc) {
     orders.push({
       label: 'up',
       tokenID: tokenIds.up,
       askPrice: upAsk,
-      usdc: upUsdc,
+      usdc: buyUpUsdc,
     });
   }
 
-  if (downUsdc >= config.minTradeUsdc) {
+  if (buyDownUsdc >= config.minTradeUsdc) {
     orders.push({
       label: 'down',
       tokenID: tokenIds.down,
       askPrice: downAsk,
-      usdc: downUsdc,
+      usdc: buyDownUsdc,
     });
   }
 
@@ -631,21 +732,13 @@ export async function main(
 
   marketState.set(marketSlug, state);
 
+  const avgUp = calcAvgPrice(state.spentUpUsdc, state.sharesUp);
+  const avgDown = calcAvgPrice(state.spentDownUsdc, state.sharesDown);
+
   logDone(
     logger,
     timestamp,
     marketSlug,
-    `up=${fmt3(upAsk)} down=${fmt3(downAsk)} combined=${fmt3(combinedAsk)} gap=${fmt3(gap)} left=${fmt1(timeLeftSec)}s spentUp=${fmt3(state.spentUpUsdc)} spentDown=${fmt3(state.spentDownUsdc)} sharesUp=${fmt3(state.sharesUp)} sharesDown=${fmt3(state.sharesDown)} trades=${state.tradeCount}`,
+    `up=${fmt3(upAsk)} down=${fmt3(downAsk)} combined=${fmt3(combinedAsk)} gap=${fmt3(gap)} left=${fmt1(timeLeftSec)}s spentUp=${fmt3(state.spentUpUsdc)} spentDown=${fmt3(state.spentDownUsdc)} avgUp=${fmt3(avgUp)} avgDown=${fmt3(avgDown)} avgPair=${fmt3(avgUp + avgDown)} trades=${state.tradeCount}`,
   );
-}
-
-function hedgeCheap(
-  upAsk: number,
-  downAsk: number,
-  signalDirection: number,
-  hedgeOnlyBelowPrice: number,
-) {
-  if (signalDirection > 0) return downAsk <= hedgeOnlyBelowPrice;
-  if (signalDirection < 0) return upAsk <= hedgeOnlyBelowPrice;
-  return upAsk <= hedgeOnlyBelowPrice || downAsk <= hedgeOnlyBelowPrice;
 }
