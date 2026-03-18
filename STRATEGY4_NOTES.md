@@ -53,7 +53,7 @@ This is meant to avoid one of the main bad patterns in the historical behavior: 
 
 These are the defaults wired into the new Strategy 4 config:
 
-- `tradeWindowStartSec = 120`
+- `tradeWindowStartSec = 300`
 - `hardStopSec = 12`
 - `cooldownMs = 3000`
 - `maxTradesPerMarket = 4`

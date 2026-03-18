@@ -29,7 +29,7 @@ export class BotService {
   private strategy = 4;
   private st4Config: Strategy4Config = {
     enabled: true,
-    tradeWindowStartSec: 120,
+    tradeWindowStartSec: 300,
     hardStopSec: 12,
     cooldownMs: 3000,
     maxTradesPerMarket: 4,
@@ -277,6 +277,9 @@ export class BotService {
   }
 
   async runBot(marketSlug: string, timestamp: any, tokenIdPair: any) {
+      if (this.isRunning.get(marketSlug)) {
+        return;
+      }
     const upPrice = PrevPriceContext.get(tokenIdPair.up);
     const downPrice = PrevPriceContext.get(tokenIdPair.down);
     if (!upPrice || !downPrice) return;

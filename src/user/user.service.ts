@@ -14,7 +14,7 @@ import { BroadcastService } from '../events/broadcast.service.js';
 import { WS_BASE, clobClient as tempClient } from '../constant.js';
 // import { handleMessage } from './st-1.js';
 // import { handleMessage } from './st-2.js';
-import { handleMessage } from './st-3.js';
+import { handleMessage } from './st-4.js';
 
 @Injectable()
 export class UserService extends EventEmitter implements OnModuleInit, OnModuleDestroy {
