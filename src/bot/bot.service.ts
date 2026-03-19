@@ -9,7 +9,7 @@ import { main as st_2_bot } from './st-2.js';
 import { main as st_3_bot } from './st-3.js';
 import { Strategy4Config, main as st_4_bot, resetStrategy4State } from './st-4.js';
 import { Strategy5Config, main as st_5_bot, resetStrategy5State } from './st-5.js';
-
+import { Strategy9Config, main as st_9_bot, resetStrategy9State } from './st-9.js';
 import { ConditionIdContext, PrevPriceContext, TokenIdContext } from '../context/market.js';
 import { DATA_API_BASE, SAFE_ADDRESS } from '../constant.js';
 import { PositionSizeContext, RoundContext, S3AllPostOrderContext, S3GroupContext, S3PositionSizeContext, S3PreOrderContext, StartContext } from '../context/bot.js';
@@ -72,6 +72,38 @@ private st5Config: Strategy5Config = {
   maxTradePrice: 0.97,
   maxTotalSpentUsdc: 180,
   maxSideSpentUsdc: 120,
+};
+
+private st9Config: Strategy9Config = {
+  enabled: true,
+  observeSec: 8,
+  stopBeforeEndSec: 10,
+  trendWindowMs: 1800,
+  cycleMs: 3500,
+  cooldownMs: 250,
+
+  trendMinMove: 0.01,
+  reversalMove: 0.012,
+
+  minImbalance: 0.015,
+  minEdge: 0.008,
+  maxPairPrice: 0.992,
+
+  targetTrendSharesPerCycle: 24,
+  minChunkShares: 4,
+  maxChunkShares: 12,
+  hedgeChunkShares: 18,
+
+  slippageBuffer: 0.0,
+  maxTradePrice: 0.97,
+
+  maxOrdersPerMarket: 140,
+  maxTotalSpentUsdc: 180,
+  maxSideSpentUsdc: 120,
+
+  flipConfirmTicks: 2,
+  scoreTrendWeight: 1.0,
+  scoreEdgeWeight: 18,
 };
 
 
@@ -241,6 +273,7 @@ private st5Config: Strategy5Config = {
     RoundContext.delete(conditionId);
     resetStrategy4State(marketSlug);
     resetStrategy5State(marketSlug);
+    resetStrategy9State(marketSlug);
     this.broadcastService.broadcast(`Round Reset for market`, {});
   }
 
@@ -286,6 +319,7 @@ private st5Config: Strategy5Config = {
       st4StarterTradeUsdc: 'starterTradeUsdc',
       st4MinOppositeSeedPrice: 'minOppositeSeedPrice'
     };
+    
 
     for (const [inputKey, configKey] of Object.entries(mapping)) {
       if (dto[inputKey] != null) {
@@ -318,6 +352,43 @@ private st5Config: Strategy5Config = {
       }
     }
 
+    const st9Mapping: Record<string, keyof Strategy9Config> = {
+      st9Enabled: 'enabled',
+      st9ObserveSec: 'observeSec',
+      st9StopBeforeEndSec: 'stopBeforeEndSec',
+      st9TrendWindowMs: 'trendWindowMs',
+      st9CycleMs: 'cycleMs',
+      st9CooldownMs: 'cooldownMs',
+    
+      st9TrendMinMove: 'trendMinMove',
+      st9ReversalMove: 'reversalMove',
+    
+      st9MinImbalance: 'minImbalance',
+      st9MinEdge: 'minEdge',
+      st9MaxPairPrice: 'maxPairPrice',
+    
+      st9TargetTrendSharesPerCycle: 'targetTrendSharesPerCycle',
+      st9MinChunkShares: 'minChunkShares',
+      st9MaxChunkShares: 'maxChunkShares',
+      st9HedgeChunkShares: 'hedgeChunkShares',
+    
+      st9SlippageBuffer: 'slippageBuffer',
+      st9MaxTradePrice: 'maxTradePrice',
+    
+      st9MaxOrdersPerMarket: 'maxOrdersPerMarket',
+      st9MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
+      st9MaxSideSpentUsdc: 'maxSideSpentUsdc',
+    
+      st9FlipConfirmTicks: 'flipConfirmTicks',
+      st9ScoreTrendWeight: 'scoreTrendWeight',
+      st9ScoreEdgeWeight: 'scoreEdgeWeight',
+    };
+    
+    for (const [inputKey, configKey] of Object.entries(st9Mapping)) {
+      if (dto[inputKey] != null) {
+        (this.st9Config as any)[configKey] = dto[inputKey];
+      }
+    }
     const config = this.getConfig();
     this.broadcastService.broadcast('Bot variables changed.', config);
     return config;
@@ -334,6 +405,7 @@ private st5Config: Strategy5Config = {
     maxCount: this.maxCount,
     strategy4: this.st4Config,
     strategy5: this.st5Config,
+    strategy9: this.st9Config,
   };
 }
 
@@ -426,7 +498,18 @@ private st5Config: Strategy5Config = {
           this.logger,
           this.st5Config,
         );
+      } else if (this.strategy === 9) {
+        await st_9_bot(
+          marketSlug,
+          timestamp,
+          upPrice.bestAsk,
+          downPrice.bestAsk,
+          this.orderService,
+          this.logger,
+          this.st9Config,
+        );
       }
+      
       
     } catch (error) {
       this.logger.error(`Error running bot for market ${marketSlug}: ${error.message}`);
