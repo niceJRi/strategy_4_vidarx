@@ -76,34 +76,41 @@ private st5Config: Strategy5Config = {
 
 private st9Config: Strategy9Config = {
   enabled: true,
-  observeSec: 2,
-  stopBeforeEndSec: 10,
+  observeSec: 7,
+  stopBeforeEndSec: 8,
   trendWindowMs: 1800,
   cycleMs: 3500,
   cooldownMs: 250,
 
-  trendMinMove: 0.003,
-  reversalMove: 0.005,
+  trendMinMove: 0.012,
+  reversalMove: 0.03,
 
-  minImbalance: 0.01,
-  minEdge: 0.003,
-  maxPairPrice: 0.995,
+  minImbalance: 0.012,
+  minEdge: 0.008,
+  maxPairPrice: 0.975,
 
-  targetTrendSharesPerCycle: 12,
-  minChunkShares: 2,
-  maxChunkShares: 8,
-  hedgeChunkShares: 6,
+  targetTrendSharesPerCycle: 280,
+  minChunkShares: 45,
+  maxChunkShares: 90,
+  hedgeChunkShares: 80,
 
   slippageBuffer: 0.003,
-  maxTradePrice: 0.99,
+  maxTradePrice: 0.97,
 
-  maxOrdersPerMarket: 80,
-  maxTotalSpentUsdc: 120,
-  maxSideSpentUsdc: 70,
+  maxOrdersPerMarket: 20,
+  maxTotalSpentUsdc: 140,
+  maxSideSpentUsdc: 95,
 
   flipConfirmTicks: 2,
   scoreTrendWeight: 0.8,
   scoreEdgeWeight: 8,
+
+  leaderMinGap: 0.05,
+  hedgeRatio: 0.35,
+  hedgeMaxPrice: 0.36,
+  burstCount: 3,
+  burstSpacingMs: 180,
+  flipMinGap: 0.07,
 };
 
 
@@ -353,36 +360,43 @@ private st9Config: Strategy9Config = {
     }
 
     const st9Mapping: Record<string, keyof Strategy9Config> = {
-      st9Enabled: 'enabled',
-      st9ObserveSec: 'observeSec',
-      st9StopBeforeEndSec: 'stopBeforeEndSec',
-      st9TrendWindowMs: 'trendWindowMs',
-      st9CycleMs: 'cycleMs',
-      st9CooldownMs: 'cooldownMs',
-    
-      st9TrendMinMove: 'trendMinMove',
-      st9ReversalMove: 'reversalMove',
-    
-      st9MinImbalance: 'minImbalance',
-      st9MinEdge: 'minEdge',
-      st9MaxPairPrice: 'maxPairPrice',
-    
-      st9TargetTrendSharesPerCycle: 'targetTrendSharesPerCycle',
-      st9MinChunkShares: 'minChunkShares',
-      st9MaxChunkShares: 'maxChunkShares',
-      st9HedgeChunkShares: 'hedgeChunkShares',
-    
-      st9SlippageBuffer: 'slippageBuffer',
-      st9MaxTradePrice: 'maxTradePrice',
-    
-      st9MaxOrdersPerMarket: 'maxOrdersPerMarket',
-      st9MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
-      st9MaxSideSpentUsdc: 'maxSideSpentUsdc',
-    
-      st9FlipConfirmTicks: 'flipConfirmTicks',
-      st9ScoreTrendWeight: 'scoreTrendWeight',
-      st9ScoreEdgeWeight: 'scoreEdgeWeight',
-    };
+  st9Enabled: 'enabled',
+  st9ObserveSec: 'observeSec',
+  st9StopBeforeEndSec: 'stopBeforeEndSec',
+  st9TrendWindowMs: 'trendWindowMs',
+  st9CycleMs: 'cycleMs',
+  st9CooldownMs: 'cooldownMs',
+
+  st9TrendMinMove: 'trendMinMove',
+  st9ReversalMove: 'reversalMove',
+
+  st9MinImbalance: 'minImbalance',
+  st9MinEdge: 'minEdge',
+  st9MaxPairPrice: 'maxPairPrice',
+
+  st9TargetTrendSharesPerCycle: 'targetTrendSharesPerCycle',
+  st9MinChunkShares: 'minChunkShares',
+  st9MaxChunkShares: 'maxChunkShares',
+  st9HedgeChunkShares: 'hedgeChunkShares',
+
+  st9SlippageBuffer: 'slippageBuffer',
+  st9MaxTradePrice: 'maxTradePrice',
+
+  st9MaxOrdersPerMarket: 'maxOrdersPerMarket',
+  st9MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
+  st9MaxSideSpentUsdc: 'maxSideSpentUsdc',
+
+  st9FlipConfirmTicks: 'flipConfirmTicks',
+  st9ScoreTrendWeight: 'scoreTrendWeight',
+  st9ScoreEdgeWeight: 'scoreEdgeWeight',
+
+  st9LeaderMinGap: 'leaderMinGap',
+  st9HedgeRatio: 'hedgeRatio',
+  st9HedgeMaxPrice: 'hedgeMaxPrice',
+  st9BurstCount: 'burstCount',
+  st9BurstSpacingMs: 'burstSpacingMs',
+  st9FlipMinGap: 'flipMinGap',
+};
     
     for (const [inputKey, configKey] of Object.entries(st9Mapping)) {
       if (dto[inputKey] != null) {

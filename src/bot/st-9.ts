@@ -31,8 +31,15 @@ export type Strategy9Config = {
   maxSideSpentUsdc: number;
 
   flipConfirmTicks: number;
-  scoreTrendWeight: number;
-  scoreEdgeWeight: number;
+  scoreTrendWeight: number; // kept for backward compatibility
+  scoreEdgeWeight: number;  // kept for backward compatibility
+
+  leaderMinGap: number;
+  hedgeRatio: number;
+  hedgeMaxPrice: number;
+  burstCount: number;
+  burstSpacingMs: number;
+  flipMinGap: number;
 };
 
 type TrendSide = 'UP' | 'DOWN';
@@ -136,6 +143,10 @@ function trimHistory(history: PricePoint[], now: number, maxMs: number) {
   }
 }
 
+function clamp(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, v));
+}
+
 function avgPrice(spentUsdc: number, shares: number): number {
   if (shares <= 0) return 0;
   return spentUsdc / shares;
@@ -164,218 +175,107 @@ function getWindowOldest(history: PricePoint[], trendWindowMs: number) {
   for (const p of history) {
     if (p.ts >= oldestAllowedTs) return p;
   }
+
   return history[0];
 }
 
-function getCycleHistory(
-  history: PricePoint[],
-  cycleStartedAt: number,
-): PricePoint[] {
-  return history.filter((p) => p.ts >= cycleStartedAt);
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function avgTrendSidePriceInCycle(
-  history: PricePoint[],
-  cycleStartedAt: number,
-  side: TrendSide,
-): number {
-  const cycleHistory = getCycleHistory(history, cycleStartedAt);
-
-  // use previous trend-side prices only, exclude latest tick
-  if (cycleHistory.length <= 1) return 0;
-
-  const previous = cycleHistory.slice(0, -1);
-  if (previous.length === 0) return 0;
-
-  const sum = previous.reduce((acc, p) => {
-    return acc + (side === 'UP' ? p.upAsk : p.downAsk);
-  }, 0);
-
-  return round6(sum / previous.length);
+function getSideShares(state: MarketState, side: TrendSide) {
+  return side === 'UP' ? state.sharesUp : state.sharesDown;
 }
 
-function decideTrendByCycleAverage(params: {
-  state: MarketState;
-  upPrice: number;
-  downPrice: number;
-}): {
-  decidedTrend: TrendDirection;
-  cycleAvg: number;
-  currentTrendPrice: number;
-  used: boolean;
-} {
-  const { state, upPrice, downPrice } = params;
+function getSideSpent(state: MarketState, side: TrendSide) {
+  return side === 'UP' ? state.spentUpUsdc : state.spentDownUsdc;
+}
 
-  if (state.cycleTrend === 'FLAT') {
-    return {
-      decidedTrend: 'FLAT',
-      cycleAvg: 0,
-      currentTrendPrice: 0,
-      used: false,
-    };
+function getCycleTrendAvg(state: MarketState, side: TrendSide) {
+  if (state.cycleTrend === side && state.cycleTrendShares > 0) {
+    return round6(state.cycleTrendSpentUsdc / state.cycleTrendShares);
   }
 
-  const cycleAvg = avgTrendSidePriceInCycle(
-    state.history,
-    state.cycleStartedAt,
-    state.cycleTrend,
-  );
-
-  const currentTrendPrice =
-    state.cycleTrend === 'UP' ? upPrice : downPrice;
-
-  if (cycleAvg <= 0) {
-    return {
-      decidedTrend: state.cycleTrend,
-      cycleAvg: 0,
-      currentTrendPrice: round6(currentTrendPrice),
-      used: false,
-    };
-  }
-
-  // keep current trend if previous average of same trend side
-  // is bigger than current price. otherwise flip side.
-  const keepCurrent = cycleAvg > currentTrendPrice;
-
-  return {
-    decidedTrend: keepCurrent
-      ? state.cycleTrend
-      : oppositeSide(state.cycleTrend),
-    cycleAvg: round6(cycleAvg),
-    currentTrendPrice: round6(currentTrendPrice),
-    used: true,
-  };
+  return round6(avgPrice(getSideSpent(state, side), getSideShares(state, side)));
 }
 
-function detectTrend(
-  history: PricePoint[],
-  trendWindowMs: number,
-  trendMinMove: number,
-): TrendDirection {
-  if (history.length < 2) return 'FLAT';
+function getLeaderSignal(params: {
+  history: PricePoint[];
+  trendWindowMs: number;
+  trendMinMove: number;
+  minImbalance: number;
+  leaderMinGap: number;
+}) {
+  const {
+    history,
+    trendWindowMs,
+    trendMinMove,
+    minImbalance,
+    leaderMinGap,
+  } = params;
 
   const newest = getLatest(history);
   const oldest = getWindowOldest(history, trendWindowMs);
-  if (!newest || !oldest) return 'FLAT';
 
-  const upMove = newest.upAsk - oldest.upAsk;
-
-  if (upMove >= trendMinMove) return 'UP';
-  if (upMove <= -trendMinMove) return 'DOWN';
-  return 'FLAT';
-}
-
-function calcImbalanceFromAsks(upAsk: number, downAsk: number): number {
-  // if upAsk is rising and downAsk is falling, market is leaning UP.
-  // This is only a proxy because repo does not keep full depth.
-  return round6(upAsk - downAsk);
-}
-
-function calcCycleAvg(state: MarketState, side: TrendSide) {
-  if (side === 'UP') {
-    return avgPrice(state.spentUpUsdc, state.sharesUp);
+  if (!newest || !oldest) {
+    return {
+      leader: 'FLAT' as TrendDirection,
+      upMove: 0,
+      downMove: 0,
+      gap: 0,
+      pairPrice: 0,
+      upStrength: 0,
+      downStrength: 0,
+    };
   }
-  return avgPrice(state.spentDownUsdc, state.sharesDown);
+
+  const upMove = round6(newest.upAsk - oldest.upAsk);
+  const downMove = round6(newest.downAsk - oldest.downAsk);
+  const gap = round6(newest.upAsk - newest.downAsk);
+  const pairPrice = round6(newest.upAsk + newest.downAsk);
+
+  let upStrength = 0;
+  let downStrength = 0;
+
+  if (gap >= leaderMinGap) upStrength += 1;
+  if (-gap >= leaderMinGap) downStrength += 1;
+
+  if (upMove >= trendMinMove) upStrength += 1;
+  if (downMove >= trendMinMove) downStrength += 1;
+
+  if (downMove <= -minImbalance) upStrength += 1;
+  if (upMove <= -minImbalance) downStrength += 1;
+
+  let leader: TrendDirection = 'FLAT';
+
+  if (upStrength >= 2 && upStrength > downStrength) {
+  leader = 'UP';
+} else if (downStrength >= 2 && downStrength > upStrength) {
+  leader = 'DOWN';
+} else if (gap >= leaderMinGap && upMove >= -0.002) {
+  leader = 'UP';
+} else if (-gap >= leaderMinGap && downMove >= -0.002) {
+  leader = 'DOWN';
+} else if (upMove >= trendMinMove * 1.2 && gap > 0) {
+  leader = 'UP';
+} else if (downMove >= trendMinMove * 1.2 && gap < 0) {
+  leader = 'DOWN';
 }
-
-function clamp(v: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, v));
-}
-
-function computeScore(params: {
-  trend: TrendDirection;
-  upAsk: number;
-  downAsk: number;
-  trendMinMove: number;
-  scoreTrendWeight: number;
-  scoreEdgeWeight: number;
-}) {
-  const {
-    trend,
-    upAsk,
-    downAsk,
-    scoreTrendWeight,
-    scoreEdgeWeight,
-  } = params;
-
-  const imbalance = calcImbalanceFromAsks(upAsk, downAsk);
-  const pairEdge = 1 - (upAsk + downAsk);
-
-  let upScore = 0;
-  let downScore = 0;
-
-  if (trend === 'UP') upScore += scoreTrendWeight;
-  if (trend === 'DOWN') downScore += scoreTrendWeight;
-
-  upScore += imbalance * scoreEdgeWeight;
-  downScore += (-imbalance) * scoreEdgeWeight;
-
-  upScore += pairEdge * 10;
-  downScore += pairEdge * 10;
 
   return {
-    upScore: round6(upScore),
-    downScore: round6(downScore),
-    pairEdge: round6(pairEdge),
-    imbalance: round6(imbalance),
+    leader,
+    upMove,
+    downMove,
+    gap,
+    pairPrice,
+    upStrength,
+    downStrength,
   };
 }
 
-function chooseTrendSide(
-  trend: TrendDirection,
-  upAsk: number,
-  downAsk: number,
-  config: Strategy9Config,
-): TrendDirection {
-  const { upScore, downScore, pairEdge, imbalance } = computeScore({
-    trend,
-    upAsk,
-    downAsk,
-    trendMinMove: config.trendMinMove,
-    scoreTrendWeight: config.scoreTrendWeight,
-    scoreEdgeWeight: config.scoreEdgeWeight,
-  });
-
-  if (pairEdge < -0.03) return 'FLAT';
-
-  if (upScore > downScore && imbalance >= config.minImbalance) return 'UP';
-  if (downScore > upScore && -imbalance >= config.minImbalance) return 'DOWN';
-
-  return trend;
-}
-
-function calcAdaptiveChunkShares(params: {
-  trendSide: TrendSide;
-  upAsk: number;
-  downAsk: number;
-  state: MarketState;
-  config: Strategy9Config;
-}) {
-  const { trendSide, upAsk, downAsk, state, config } = params;
-  const trendPrice = trendSide === 'UP' ? upAsk : downAsk;
-  const hedgePrice = trendSide === 'UP' ? downAsk : upAsk;
-  const rawEdge = 1 - (trendPrice + hedgePrice);
-
-  const exposurePenalty =
-    (state.spentUpUsdc + state.spentDownUsdc) / Math.max(1, config.maxTotalSpentUsdc);
-
-  const sideSpent =
-    trendSide === 'UP' ? state.spentUpUsdc : state.spentDownUsdc;
-  const sidePenalty = sideSpent / Math.max(1, config.maxSideSpentUsdc);
-
-  const confidence = clamp(
-    (rawEdge - config.minEdge) * 20 +
-      (1 - exposurePenalty) * 0.5 +
-      (1 - sidePenalty) * 0.5,
-    0,
-    1,
-  );
-
-  const chunk =
-    config.minChunkShares +
-    confidence * (config.maxChunkShares - config.minChunkShares);
-
-  return round6(clamp(chunk, config.minChunkShares, config.maxChunkShares));
+function getBurstWeights(count: number) {
+  const base = [0.40, 0.30, 0.18, 0.12, 0.08, 0.06];
+  return Array.from({ length: Math.max(1, count) }, (_, i) => base[i] ?? base[base.length - 1]);
 }
 
 async function submitBuyByShares(params: {
@@ -501,26 +401,27 @@ async function buySideShares(params: {
     return false;
   }
 
-  const totalSpent = state.spentUpUsdc + state.spentDownUsdc;
-  if (totalSpent + shares * askPrice > config.maxTotalSpentUsdc) {
+  const spendTry = round6(shares * askPrice);
+  const totalSpent = round6(state.spentUpUsdc + state.spentDownUsdc);
+  if (totalSpent + spendTry > config.maxTotalSpentUsdc) {
     log(
       logger,
       timestamp,
       marketSlug,
       'SKIP',
-      `total_cap_guard totalSpent=${fmt6(totalSpent)} try=${fmt6(shares * askPrice)} max=${fmt6(config.maxTotalSpentUsdc)}`,
+      `total_cap_guard totalSpent=${fmt6(totalSpent)} try=${fmt6(spendTry)} max=${fmt6(config.maxTotalSpentUsdc)}`,
     );
     return false;
   }
 
-  const sideSpent = side === 'UP' ? state.spentUpUsdc : state.spentDownUsdc;
-  if (sideSpent + shares * askPrice > config.maxSideSpentUsdc) {
+  const sideSpent = getSideSpent(state, side);
+  if (sideSpent + spendTry > config.maxSideSpentUsdc) {
     log(
       logger,
       timestamp,
       marketSlug,
       'SKIP',
-      `side_cap_guard side=${side} sideSpent=${fmt6(sideSpent)} try=${fmt6(shares * askPrice)} max=${fmt6(config.maxSideSpentUsdc)}`,
+      `side_cap_guard side=${side} sideSpent=${fmt6(sideSpent)} try=${fmt6(spendTry)} max=${fmt6(config.maxSideSpentUsdc)}`,
     );
     return false;
   }
@@ -541,14 +442,12 @@ async function buySideShares(params: {
 
   if (!getAcceptedOrder(response)) return false;
 
-  const cost = round6(shares * askPrice);
-
   if (side === 'UP') {
     state.sharesUp = round6(state.sharesUp + shares);
-    state.spentUpUsdc = round6(state.spentUpUsdc + cost);
+    state.spentUpUsdc = round6(state.spentUpUsdc + spendTry);
   } else {
     state.sharesDown = round6(state.sharesDown + shares);
-    state.spentDownUsdc = round6(state.spentDownUsdc + cost);
+    state.spentDownUsdc = round6(state.spentDownUsdc + spendTry);
   }
 
   state.orderCount += 1;
@@ -556,7 +455,7 @@ async function buySideShares(params: {
 
   if (state.cycleTrend === side) {
     state.cycleTrendShares = round6(state.cycleTrendShares + shares);
-    state.cycleTrendSpentUsdc = round6(state.cycleTrendSpentUsdc + cost);
+    state.cycleTrendSpentUsdc = round6(state.cycleTrendSpentUsdc + spendTry);
   }
 
   log(
@@ -570,6 +469,95 @@ async function buySideShares(params: {
   return true;
 }
 
+async function buyTrendBursts(params: {
+  state: MarketState;
+  orderService: OrderService;
+  tokenIds: { up: string; down: string };
+  side: TrendSide;
+  askPrice: number;
+  config: Strategy9Config;
+  logger: Logger;
+  timestamp: any;
+  marketSlug: string;
+}) {
+  const {
+    state,
+    orderService,
+    tokenIds,
+    side,
+    askPrice,
+    config,
+    logger,
+    timestamp,
+    marketSlug,
+  } = params;
+
+  const remainingTarget = round6(
+    config.targetTrendSharesPerCycle - state.cycleTrendShares,
+  );
+
+  if (remainingTarget <= 0) return false;
+
+  const weights = getBurstWeights(config.burstCount);
+  let remaining = remainingTarget;
+  let filledAny = false;
+
+  for (let i = 0; i < config.burstCount; i++) {
+    if (remaining <= 0) break;
+    if (state.orderCount >= config.maxOrdersPerMarket) break;
+
+    const weight = weights[i] ?? weights[weights.length - 1];
+    const ideal = round6(remainingTarget * weight);
+
+    let shares = round6(
+      clamp(
+        ideal,
+        Math.min(config.minChunkShares, Math.max(remaining, 0.000001)),
+        config.maxChunkShares,
+      ),
+    );
+
+    shares = round6(Math.min(shares, remaining));
+    if (shares <= 0) break;
+
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'BURST',
+      `side=${side} idx=${i + 1}/${config.burstCount} shares=${fmt6(shares)} remainingBefore=${fmt6(remaining)}`,
+    );
+
+    const ok = await buySideShares({
+      state,
+      orderService,
+      tokenIds,
+      side,
+      askPrice,
+      shares,
+      config,
+      logger,
+      timestamp,
+      marketSlug,
+    });
+
+    if (!ok) {
+      if (!filledAny) return false;
+      break;
+    }
+
+    filledAny = true;
+    remaining = round6(remaining - shares);
+
+    if (remaining <= 0) break;
+    if (i < config.burstCount - 1 && config.burstSpacingMs > 0) {
+      await sleep(config.burstSpacingMs);
+    }
+  }
+
+  return filledAny;
+}
+
 function shouldHedge(params: {
   state: MarketState;
   trendSide: TrendSide;
@@ -579,39 +567,47 @@ function shouldHedge(params: {
 }) {
   const { state, trendSide, upAsk, downAsk, config } = params;
 
-  const trendAvg = calcCycleAvg(state, trendSide);
-  const hedgePrice = trendSide === 'UP' ? downAsk : upAsk;
-  const edge = 1 - (trendAvg + hedgePrice);
+  const hedgeSide = oppositeSide(trendSide);
+  const trendAvg = getCycleTrendAvg(state, trendSide);
+  const hedgePrice = hedgeSide === 'UP' ? upAsk : downAsk;
+  const edge = round6(1 - (trendAvg + hedgePrice));
+
+  const trendShares = getSideShares(state, trendSide);
+  const hedgeShares = getSideShares(state, hedgeSide);
+
+  const targetHedgeShares = round6(trendShares * config.hedgeRatio);
+  const desired = round6(Math.max(0, targetHedgeShares - hedgeShares));
 
   return {
+    hedgeSide,
     trendAvg: round6(trendAvg),
     hedgePrice: round6(hedgePrice),
-    edge: round6(edge),
+    edge,
+    trendShares: round6(trendShares),
+    hedgeShares: round6(hedgeShares),
+    targetHedgeShares,
+    desired,
     ok:
       trendAvg > 0 &&
       hedgePrice > 0 &&
+      hedgePrice <= config.hedgeMaxPrice &&
       edge >= config.minEdge &&
-      trendAvg + hedgePrice <= config.maxPairPrice,
+      trendAvg + hedgePrice <= config.maxPairPrice &&
+      desired > 0,
   };
 }
 
-function detectReversal(params: {
-  history: PricePoint[];
-  currentTrend: TrendSide;
-  trendWindowMs: number;
-  reversalMove: number;
-}) {
-  const { history, currentTrend, trendWindowMs, reversalMove } = params;
-  if (history.length < 2) return false;
-
-  const newest = getLatest(history);
-  const oldest = getWindowOldest(history, trendWindowMs);
-  if (!newest || !oldest) return false;
-
-  const upMove = newest.upAsk - oldest.upAsk;
-
-  if (currentTrend === 'UP') return upMove <= -reversalMove;
-  return upMove >= reversalMove;
+function startNewCycle(
+  state: MarketState,
+  side: TrendSide,
+  now: number,
+) {
+  state.cycleTrend = side;
+  state.cycleStartedAt = now;
+  state.cycleTrendShares = 0;
+  state.cycleTrendSpentUsdc = 0;
+  state.pendingFlipSide = null;
+  state.pendingFlipCount = 0;
 }
 
 export function resetStrategy9State(marketSlug?: string) {
@@ -659,7 +655,7 @@ export async function main(
   trimHistory(
     state.history,
     now,
-    Math.max(config.trendWindowMs * 3, 12_000),
+    Math.max(config.trendWindowMs * 4, 15_000),
   );
 
   const lifeSec = (now - state.firstSeenAt) / 1000;
@@ -687,132 +683,138 @@ export async function main(
     return;
   }
 
-  const rawTrend = detectTrend(
-    state.history,
-    config.trendWindowMs,
-    config.trendMinMove,
-  );
-
-  const scoreChosenTrend = chooseTrendSide(rawTrend, upPrice, downPrice, config);
-
-  const { upScore, downScore, pairEdge, imbalance } = computeScore({
-    trend: rawTrend,
-    upAsk: upPrice,
-    downAsk: downPrice,
+  const signal = getLeaderSignal({
+    history: state.history,
+    trendWindowMs: config.trendWindowMs,
     trendMinMove: config.trendMinMove,
-    scoreTrendWeight: config.scoreTrendWeight,
-    scoreEdgeWeight: config.scoreEdgeWeight,
+    minImbalance: config.minImbalance,
+    leaderMinGap: config.leaderMinGap,
   });
-
-  let chosenTrend: TrendDirection = scoreChosenTrend;
-
-  // after cycle starts, decide trend by:
-  // avg(previous prices of current trend side during cycle) > current same-side price
-  // => keep current trend
-  // else => switch to other side
-  const avgDecision = decideTrendByCycleAverage({
-    state,
-    upPrice,
-    downPrice,
-  });
-
-  if (state.cycleTrend !== 'FLAT' && avgDecision.used) {
-    chosenTrend = avgDecision.decidedTrend;
-
-    log(
-      logger,
-      timestamp,
-      marketSlug,
-      'AVG_TREND',
-      `cycleTrend=${state.cycleTrend} cycleAvg=${fmt6(avgDecision.cycleAvg)} currentTrendPrice=${fmt6(avgDecision.currentTrendPrice)} decided=${chosenTrend}`,
-    );
-  }
 
   log(
     logger,
     timestamp,
     marketSlug,
     'DEBUG',
-    `trend=${rawTrend} scoreChosen=${scoreChosenTrend} finalChosen=${chosenTrend} up=${fmt3(upPrice)} down=${fmt3(downPrice)} upScore=${fmt6(upScore)} downScore=${fmt6(downScore)} pairEdge=${fmt6(pairEdge)} imbalance=${fmt6(imbalance)} reward=${fmt6(reward(state))}`,
+    `leader=${signal.leader} up=${fmt3(upPrice)} down=${fmt3(downPrice)} gap=${fmt6(signal.gap)} pair=${fmt6(signal.pairPrice)} upMove=${fmt6(signal.upMove)} downMove=${fmt6(signal.downMove)} upStr=${signal.upStrength} downStr=${signal.downStrength} reward=${fmt6(reward(state))}`,
   );
 
-  if (chosenTrend === 'FLAT') return;
+  if (signal.pairPrice > config.maxPairPrice && state.cycleTrend === 'FLAT') {
+  log(
+    logger,
+    timestamp,
+    marketSlug,
+    'DEBUG',
+    `pair_over_limit_for_hedge_only pair=${fmt6(signal.pairPrice)} max=${fmt6(config.maxPairPrice)}`,
+  );
+}
+
+  if (signal.leader === 'FLAT' && state.cycleTrend === 'FLAT') return;
 
   const cycleAgeMs = now - state.cycleStartedAt;
-  const trendSide = chosenTrend as TrendSide;
 
-  if (state.cycleTrend === 'FLAT') {
-    state.cycleTrend = trendSide;
-    state.cycleStartedAt = now;
-    state.cycleTrendShares = 0;
-    state.cycleTrendSpentUsdc = 0;
-    state.pendingFlipSide = null;
-    state.pendingFlipCount = 0;
-
-    log(logger, timestamp, marketSlug, 'CYCLE', `start trend=${trendSide}`);
+  if (state.cycleTrend === 'FLAT' && signal.leader !== 'FLAT') {
+    startNewCycle(state, signal.leader as TrendSide, now);
+    log(logger, timestamp, marketSlug, 'CYCLE', `start trend=${state.cycleTrend}`);
   }
 
-  // flip confirmation
-  if (state.cycleTrend !== trendSide) {
-    if (state.pendingFlipSide === trendSide) {
-      state.pendingFlipCount += 1;
-    } else {
-      state.pendingFlipSide = trendSide;
-      state.pendingFlipCount = 1;
-    }
+  if (state.cycleTrend !== 'FLAT' && signal.leader !== 'FLAT' && state.cycleTrend !== signal.leader) {
+    const leaderSide = signal.leader as TrendSide;
+    const strongFlip =
+      Math.abs(signal.gap) >= config.flipMinGap &&
+      (
+        (leaderSide === 'UP' && signal.upMove >= config.reversalMove) ||
+        (leaderSide === 'DOWN' && signal.downMove >= config.reversalMove)
+      );
 
-    log(
-      logger,
-      timestamp,
-      marketSlug,
-      'FLIP_CHECK',
-      `current=${state.cycleTrend} pending=${state.pendingFlipSide} count=${state.pendingFlipCount}/${config.flipConfirmTicks}`,
-    );
+    if (cycleAgeMs >= config.cycleMs || strongFlip) {
+      if (state.pendingFlipSide === leaderSide) {
+        state.pendingFlipCount += 1;
+      } else {
+        state.pendingFlipSide = leaderSide;
+        state.pendingFlipCount = 1;
+      }
 
-    if (state.pendingFlipCount >= config.flipConfirmTicks) {
-      state.cycleTrend = trendSide;
-      state.cycleStartedAt = now;
-      state.cycleTrendShares = 0;
-      state.cycleTrendSpentUsdc = 0;
-      state.pendingFlipSide = null;
-      state.pendingFlipCount = 0;
+      log(
+        logger,
+        timestamp,
+        marketSlug,
+        'FLIP_CHECK',
+        `current=${state.cycleTrend} pending=${leaderSide} count=${state.pendingFlipCount}/${config.flipConfirmTicks} strongFlip=${strongFlip}`,
+      );
 
-      log(logger, timestamp, marketSlug, 'CYCLE', `flip_to=${trendSide}`);
-    } else {
-      return;
+      if (state.pendingFlipCount >= config.flipConfirmTicks) {
+        startNewCycle(state, leaderSide, now);
+        log(logger, timestamp, marketSlug, 'CYCLE', `flip_to=${leaderSide}`);
+      } else {
+        return;
+      }
     }
   } else {
     state.pendingFlipSide = null;
     state.pendingFlipCount = 0;
   }
 
-  // 1) trend buy
+  if (state.cycleTrend === 'FLAT') return;
+
+  const trendSide = state.cycleTrend as TrendSide;
+  const trendAsk = trendSide === 'UP' ? upPrice : downPrice;
+
+  const canTrendBuy =
+  trendAsk > 0 &&
+  trendAsk <= config.maxTradePrice &&
+  (
+    signal.leader === trendSide ||
+    state.cycleTrendShares <= 0 ||
+    cycleAgeMs <= config.cycleMs
+  );
   if (
-    cycleAgeMs <= config.cycleMs &&
+    canTrendBuy &&
     state.cycleTrendShares < config.targetTrendSharesPerCycle
   ) {
-    const askPrice = trendSide === 'UP' ? upPrice : downPrice;
-    const remaining = round6(
-      config.targetTrendSharesPerCycle - state.cycleTrendShares,
-    );
-
-    const adaptiveChunk = calcAdaptiveChunkShares({
-      trendSide,
-      upAsk: upPrice,
-      downAsk: downPrice,
+    const burstOk = await buyTrendBursts({
       state,
+      orderService,
+      tokenIds,
+      side: trendSide,
+      askPrice: trendAsk,
       config,
+      logger,
+      timestamp,
+      marketSlug,
     });
 
-    const shares = round6(Math.min(remaining, adaptiveChunk));
+    if (burstOk) return;
+  }
+
+  const hedgeCheck = shouldHedge({
+    state,
+    trendSide,
+    upAsk: upPrice,
+    downAsk: downPrice,
+    config,
+  });
+
+  if (hedgeCheck.ok) {
+    const hedgeShares = round6(
+      Math.min(hedgeCheck.desired, config.hedgeChunkShares),
+    );
+
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'HEDGE',
+      `trend=${trendSide} hedge=${hedgeCheck.hedgeSide} trendAvg=${fmt6(hedgeCheck.trendAvg)} hedgeAsk=${fmt6(hedgeCheck.hedgePrice)} edge=${fmt6(hedgeCheck.edge)} trendShares=${fmt6(hedgeCheck.trendShares)} hedgeShares=${fmt6(hedgeCheck.hedgeShares)} targetHedge=${fmt6(hedgeCheck.targetHedgeShares)} chunk=${fmt6(hedgeShares)}`,
+    );
 
     const ok = await buySideShares({
       state,
       orderService,
       tokenIds,
-      side: trendSide,
-      askPrice,
-      shares,
+      side: hedgeCheck.hedgeSide,
+      askPrice: hedgeCheck.hedgePrice,
+      shares: hedgeShares,
       config,
       logger,
       timestamp,
@@ -822,76 +824,14 @@ export async function main(
     if (ok) return;
   }
 
-  // 2) hedge when opposite is cheap enough versus avg trend fill
-  const hedgeCheck = shouldHedge({
-    state,
-    trendSide: state.cycleTrend as TrendSide,
-    upAsk: upPrice,
-    downAsk: downPrice,
-    config,
-  });
-
-  if (hedgeCheck.ok) {
-    const hedgeSide = oppositeSide(state.cycleTrend as TrendSide);
-
-    const trendShares =
-      state.cycleTrend === 'UP' ? state.sharesUp : state.sharesDown;
-    const hedgeShares =
-      hedgeSide === 'UP' ? state.sharesUp : state.sharesDown;
-
-    const desired = round6(trendShares - hedgeShares);
-    if (desired > 0) {
-      const hedgeAsk = hedgeSide === 'UP' ? upPrice : downPrice;
-      const hedgeChunk = round6(Math.min(desired, config.hedgeChunkShares));
-
-      log(
-        logger,
-        timestamp,
-        marketSlug,
-        'HEDGE',
-        `trend=${state.cycleTrend} hedge=${hedgeSide} trendAvg=${fmt6(hedgeCheck.trendAvg)} hedgeAsk=${fmt6(hedgeCheck.hedgePrice)} edge=${fmt6(hedgeCheck.edge)} desired=${fmt6(desired)} chunk=${fmt6(hedgeChunk)}`,
-      );
-
-      const ok = await buySideShares({
-        state,
-        orderService,
-        tokenIds,
-        side: hedgeSide,
-        askPrice: hedgeAsk,
-        shares: hedgeChunk,
-        config,
-        logger,
-        timestamp,
-        marketSlug,
-      });
-
-      if (ok) return;
-    }
-  }
-
-  // 3) if cycle is old and reversal is obvious, start new cycle
-  const reversal = detectReversal({
-    history: state.history,
-    currentTrend: state.cycleTrend as TrendSide,
-    trendWindowMs: config.trendWindowMs,
-    reversalMove: config.reversalMove,
-  });
-
-  if (cycleAgeMs > config.cycleMs && reversal) {
-    const nextTrend = oppositeSide(state.cycleTrend as TrendSide);
-    state.cycleTrend = nextTrend;
-    state.cycleStartedAt = now;
-    state.cycleTrendShares = 0;
-    state.cycleTrendSpentUsdc = 0;
-    state.pendingFlipSide = null;
-    state.pendingFlipCount = 0;
-
+  if (cycleAgeMs > config.cycleMs * 1.4 && signal.leader !== 'FLAT' && signal.leader !== state.cycleTrend) {
+    startNewCycle(state, signal.leader as TrendSide, now);
     log(
       logger,
       timestamp,
       marketSlug,
       'CYCLE',
-      `reversal_restart trend=${nextTrend}`,
+      `stale_restart trend=${state.cycleTrend}`,
     );
   }
 }
