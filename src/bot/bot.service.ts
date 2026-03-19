@@ -8,6 +8,7 @@ import { main as st_1_bot } from './st-1.js';
 import { main as st_2_bot } from './st-2.js';
 import { main as st_3_bot } from './st-3.js';
 import { Strategy4Config, main as st_4_bot, resetStrategy4State } from './st-4.js';
+import { Strategy5Config, main as st_5_bot, resetStrategy5State } from './st-5.js';
 
 import { ConditionIdContext, PrevPriceContext, TokenIdContext } from '../context/market.js';
 import { DATA_API_BASE, SAFE_ADDRESS } from '../constant.js';
@@ -29,31 +30,51 @@ export class BotService {
   private strategy = 4;
   private st4Config: Strategy4Config = {
   enabled: true,
-  tradeWindowStartSec: 285,
-  hardStopSec: 8,
-  cooldownMs: 500,
-  maxTradesPerMarket: 18,
-  maxMarketExposureUsdc: 120,
-  maxTradeUsdc: 12,
+  // Data-driven defaults from the uploaded 02-12 ~ 03-15 CSV set.
+  // Vidarx usually starts within the first 10-15 seconds and is mostly done
+  // around the final 55-70 seconds, not in the last few seconds.
+  tradeWindowStartSec: 294,
+  hardStopSec: 58,
+  cooldownMs: 2200,
+  maxTradesPerMarket: 64,
+  maxMarketExposureUsdc: 180,
+  maxTradeUsdc: 24,
   minTradeUsdc: 2,
-  maxBudgetFractionPerTrade: 0.15,
-  minPriceGap: 0.02,
-  strongPriceGap: 0.10,
-  maxCombinedAsk: 1.04,
-  hedgeOnlyBelowPrice: 0.42,
-  hedgeCombinedCap: 1.02,
+  maxBudgetFractionPerTrade: 0.16,
+  minPriceGap: 0.008,
+  strongPriceGap: 0.09,
+  maxCombinedAsk: 1.01,
+  hedgeOnlyBelowPrice: 0.36,
+  hedgeCombinedCap: 0.985,
   minLeaderShare: 0.56,
-  maxLeaderShare: 0.74,
-  maxOneSideExposurePct: 0.66,
-  slippageBuffer: 0.00,
+  maxLeaderShare: 0.79,
+  maxOneSideExposurePct: 0.79,
+  slippageBuffer: 0.0,
 
-  // new
-  maxAvgPairPrice: 0.98,
-  maxSideSpentUsdc: 72,
-  rebalanceBand: 0.07,
-  starterTradeUsdc: 4,
-  minOppositeSeedPrice: 0.35,
+  maxAvgPairPrice: 0.985,
+  maxSideSpentUsdc: 110,
+  rebalanceBand: 0.05,
+  starterTradeUsdc: 6,
+  minOppositeSeedPrice: 0.32,
 };
+private st5Config: Strategy5Config = {
+  enabled: true,
+  observeSec: 9,
+  stopBeforeEndSec: 9,
+  trendWindowMs: 2000,
+  cycleMs: 2000,
+  cooldownMs: 350,
+  trendMinMove: 0.015,
+  cycleTargetTrendShares: 15,
+  trendChunkShares: 5,
+  maxOrdersPerMarket: 120,
+  slippageBuffer: 0.0,
+  maxTradePrice: 0.97,
+  maxTotalSpentUsdc: 180,
+  maxSideSpentUsdc: 120,
+};
+
+
   private preOrdersCreated = new Map<string, boolean>();
   private isMerging = new Map<string, boolean>();
 
@@ -219,6 +240,7 @@ export class BotService {
     if (!conditionId) return;
     RoundContext.delete(conditionId);
     resetStrategy4State(marketSlug);
+    resetStrategy5State(marketSlug);
     this.broadcastService.broadcast(`Round Reset for market`, {});
   }
 
@@ -271,23 +293,49 @@ export class BotService {
       }
     }
 
+    const st5Mapping: Record<string, keyof Strategy5Config> = {
+  st5Enabled: 'enabled',
+  st5ObserveSec: 'observeSec',
+  st5StopBeforeEndSec: 'stopBeforeEndSec',
+  st5TrendWindowMs: 'trendWindowMs',
+  st5CycleMs: 'cycleMs',
+  st5CooldownMs: 'cooldownMs',
+
+  st5TrendMinMove: 'trendMinMove',
+  st5CycleTargetTrendShares: 'cycleTargetTrendShares',
+  st5MaxOrdersPerMarket: 'maxOrdersPerMarket',
+
+  st5SlippageBuffer: 'slippageBuffer',
+  st5MaxTradePrice: 'maxTradePrice',
+
+  st5MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
+  st5MaxSideSpentUsdc: 'maxSideSpentUsdc',
+};
+
+    for (const [inputKey, configKey] of Object.entries(st5Mapping)) {
+      if (dto[inputKey] != null) {
+        (this.st5Config as any)[configKey] = dto[inputKey];
+      }
+    }
+
     const config = this.getConfig();
     this.broadcastService.broadcast('Bot variables changed.', config);
     return config;
   }
 
   getConfig() {
-    return {
-      started: StartContext.get("start"),
-      strategy: this.strategy,
-      baseSize: this.baseSize,
-      priceThreshold: this.priceThreshold,
-      profit: this.profit,
-      rate: this.rate,
-      maxCount: this.maxCount,
-      strategy4: this.st4Config,
-    };
-  }
+  return {
+    started: StartContext.get("start"),
+    strategy: this.strategy,
+    baseSize: this.baseSize,
+    priceThreshold: this.priceThreshold,
+    profit: this.profit,
+    rate: this.rate,
+    maxCount: this.maxCount,
+    strategy4: this.st4Config,
+    strategy5: this.st5Config,
+  };
+}
 
   async runBot(marketSlug: string, timestamp: any, tokenIdPair: any) {
       if (this.isRunning.get(marketSlug)) {
@@ -358,7 +406,7 @@ export class BotService {
           this.orderService, 
           this.logger
         );
-      } else {
+            } else if (this.strategy === 4) {
         await st_4_bot(
           marketSlug,
           timestamp,
@@ -368,7 +416,18 @@ export class BotService {
           this.logger,
           this.st4Config,
         );
+      } else if (this.strategy === 5) {
+        await st_5_bot(
+          marketSlug,
+          timestamp,
+          upPrice.bestAsk,
+          downPrice.bestAsk,
+          this.orderService,
+          this.logger,
+          this.st5Config,
+        );
       }
+      
     } catch (error) {
       this.logger.error(`Error running bot for market ${marketSlug}: ${error.message}`);
     } finally {
