@@ -167,6 +167,86 @@ function getWindowOldest(history: PricePoint[], trendWindowMs: number) {
   return history[0];
 }
 
+function getCycleHistory(
+  history: PricePoint[],
+  cycleStartedAt: number,
+): PricePoint[] {
+  return history.filter((p) => p.ts >= cycleStartedAt);
+}
+
+function avgTrendSidePriceInCycle(
+  history: PricePoint[],
+  cycleStartedAt: number,
+  side: TrendSide,
+): number {
+  const cycleHistory = getCycleHistory(history, cycleStartedAt);
+
+  // use previous trend-side prices only, exclude latest tick
+  if (cycleHistory.length <= 1) return 0;
+
+  const previous = cycleHistory.slice(0, -1);
+  if (previous.length === 0) return 0;
+
+  const sum = previous.reduce((acc, p) => {
+    return acc + (side === 'UP' ? p.upAsk : p.downAsk);
+  }, 0);
+
+  return round6(sum / previous.length);
+}
+
+function decideTrendByCycleAverage(params: {
+  state: MarketState;
+  upPrice: number;
+  downPrice: number;
+}): {
+  decidedTrend: TrendDirection;
+  cycleAvg: number;
+  currentTrendPrice: number;
+  used: boolean;
+} {
+  const { state, upPrice, downPrice } = params;
+
+  if (state.cycleTrend === 'FLAT') {
+    return {
+      decidedTrend: 'FLAT',
+      cycleAvg: 0,
+      currentTrendPrice: 0,
+      used: false,
+    };
+  }
+
+  const cycleAvg = avgTrendSidePriceInCycle(
+    state.history,
+    state.cycleStartedAt,
+    state.cycleTrend,
+  );
+
+  const currentTrendPrice =
+    state.cycleTrend === 'UP' ? upPrice : downPrice;
+
+  if (cycleAvg <= 0) {
+    return {
+      decidedTrend: state.cycleTrend,
+      cycleAvg: 0,
+      currentTrendPrice: round6(currentTrendPrice),
+      used: false,
+    };
+  }
+
+  // keep current trend if previous average of same trend side
+  // is bigger than current price. otherwise flip side.
+  const keepCurrent = cycleAvg > currentTrendPrice;
+
+  return {
+    decidedTrend: keepCurrent
+      ? state.cycleTrend
+      : oppositeSide(state.cycleTrend),
+    cycleAvg: round6(cycleAvg),
+    currentTrendPrice: round6(currentTrendPrice),
+    used: true,
+  };
+}
+
 function detectTrend(
   history: PricePoint[],
   trendWindowMs: number,
@@ -284,7 +364,9 @@ function calcAdaptiveChunkShares(params: {
   const sidePenalty = sideSpent / Math.max(1, config.maxSideSpentUsdc);
 
   const confidence = clamp(
-    (rawEdge - config.minEdge) * 20 + (1 - exposurePenalty) * 0.5 + (1 - sidePenalty) * 0.5,
+    (rawEdge - config.minEdge) * 20 +
+      (1 - exposurePenalty) * 0.5 +
+      (1 - sidePenalty) * 0.5,
     0,
     1,
   );
@@ -595,7 +677,13 @@ export async function main(
   if (now - state.lastActionAt < config.cooldownMs) return;
 
   if (state.orderCount >= config.maxOrdersPerMarket) {
-    log(logger, timestamp, marketSlug, 'SKIP', `max_orders_reached=${state.orderCount}`);
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'SKIP',
+      `max_orders_reached=${state.orderCount}`,
+    );
     return;
   }
 
@@ -605,7 +693,7 @@ export async function main(
     config.trendMinMove,
   );
 
-  const chosenTrend = chooseTrendSide(rawTrend, upPrice, downPrice, config);
+  const scoreChosenTrend = chooseTrendSide(rawTrend, upPrice, downPrice, config);
 
   const { upScore, downScore, pairEdge, imbalance } = computeScore({
     trend: rawTrend,
@@ -616,12 +704,36 @@ export async function main(
     scoreEdgeWeight: config.scoreEdgeWeight,
   });
 
+  let chosenTrend: TrendDirection = scoreChosenTrend;
+
+  // after cycle starts, decide trend by:
+  // avg(previous prices of current trend side during cycle) > current same-side price
+  // => keep current trend
+  // else => switch to other side
+  const avgDecision = decideTrendByCycleAverage({
+    state,
+    upPrice,
+    downPrice,
+  });
+
+  if (state.cycleTrend !== 'FLAT' && avgDecision.used) {
+    chosenTrend = avgDecision.decidedTrend;
+
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'AVG_TREND',
+      `cycleTrend=${state.cycleTrend} cycleAvg=${fmt6(avgDecision.cycleAvg)} currentTrendPrice=${fmt6(avgDecision.currentTrendPrice)} decided=${chosenTrend}`,
+    );
+  }
+
   log(
     logger,
     timestamp,
     marketSlug,
     'DEBUG',
-    `trend=${rawTrend} chosen=${chosenTrend} up=${fmt3(upPrice)} down=${fmt3(downPrice)} upScore=${fmt6(upScore)} downScore=${fmt6(downScore)} pairEdge=${fmt6(pairEdge)} imbalance=${fmt6(imbalance)} reward=${fmt6(reward(state))}`,
+    `trend=${rawTrend} scoreChosen=${scoreChosenTrend} finalChosen=${chosenTrend} up=${fmt3(upPrice)} down=${fmt3(downPrice)} upScore=${fmt6(upScore)} downScore=${fmt6(downScore)} pairEdge=${fmt6(pairEdge)} imbalance=${fmt6(imbalance)} reward=${fmt6(reward(state))}`,
   );
 
   if (chosenTrend === 'FLAT') return;
@@ -774,6 +886,12 @@ export async function main(
     state.pendingFlipSide = null;
     state.pendingFlipCount = 0;
 
-    log(logger, timestamp, marketSlug, 'CYCLE', `reversal_restart trend=${nextTrend}`);
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'CYCLE',
+      `reversal_restart trend=${nextTrend}`,
+    );
   }
 }

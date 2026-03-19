@@ -76,34 +76,34 @@ private st5Config: Strategy5Config = {
 
 private st9Config: Strategy9Config = {
   enabled: true,
-  observeSec: 8,
+  observeSec: 2,
   stopBeforeEndSec: 10,
   trendWindowMs: 1800,
   cycleMs: 3500,
   cooldownMs: 250,
 
-  trendMinMove: 0.01,
-  reversalMove: 0.012,
+  trendMinMove: 0.003,
+  reversalMove: 0.005,
 
-  minImbalance: 0.015,
-  minEdge: 0.008,
-  maxPairPrice: 0.992,
+  minImbalance: 0.01,
+  minEdge: 0.003,
+  maxPairPrice: 0.995,
 
-  targetTrendSharesPerCycle: 24,
-  minChunkShares: 4,
-  maxChunkShares: 12,
-  hedgeChunkShares: 18,
+  targetTrendSharesPerCycle: 12,
+  minChunkShares: 2,
+  maxChunkShares: 8,
+  hedgeChunkShares: 6,
 
-  slippageBuffer: 0.0,
-  maxTradePrice: 0.97,
+  slippageBuffer: 0.003,
+  maxTradePrice: 0.99,
 
-  maxOrdersPerMarket: 140,
-  maxTotalSpentUsdc: 180,
-  maxSideSpentUsdc: 120,
+  maxOrdersPerMarket: 80,
+  maxTotalSpentUsdc: 120,
+  maxSideSpentUsdc: 70,
 
   flipConfirmTicks: 2,
-  scoreTrendWeight: 1.0,
-  scoreEdgeWeight: 18,
+  scoreTrendWeight: 0.8,
+  scoreEdgeWeight: 8,
 };
 
 
