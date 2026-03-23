@@ -29,90 +29,109 @@ export class BotService {
   private maxCount = 3; // can't buy baseSize * 2 ** maxCount
   private strategy = 4;
   private st4Config: Strategy4Config = {
-  enabled: true,
-  // Data-driven defaults from the uploaded 02-12 ~ 03-15 CSV set.
-  // Vidarx usually starts within the first 10-15 seconds and is mostly done
-  // around the final 55-70 seconds, not in the last few seconds.
-  tradeWindowStartSec: 294,
-  hardStopSec: 58,
-  cooldownMs: 2200,
-  maxTradesPerMarket: 64,
-  maxMarketExposureUsdc: 180,
-  maxTradeUsdc: 24,
-  minTradeUsdc: 2,
-  maxBudgetFractionPerTrade: 0.16,
-  minPriceGap: 0.008,
-  strongPriceGap: 0.09,
-  maxCombinedAsk: 1.01,
-  hedgeOnlyBelowPrice: 0.36,
-  hedgeCombinedCap: 0.985,
-  minLeaderShare: 0.56,
-  maxLeaderShare: 0.79,
-  maxOneSideExposurePct: 0.79,
-  slippageBuffer: 0.0,
+    enabled: true,
+    // Data-driven defaults from the uploaded 02-12 ~ 03-15 CSV set.
+    // Vidarx usually starts within the first 10-15 seconds and is mostly done
+    // around the final 55-70 seconds, not in the last few seconds.
+    tradeWindowStartSec: 294,
+    hardStopSec: 58,
+    cooldownMs: 2200,
+    maxTradesPerMarket: 64,
+    maxMarketExposureUsdc: 180,
+    maxTradeUsdc: 24,
+    minTradeUsdc: 2,
+    maxBudgetFractionPerTrade: 0.16,
+    minPriceGap: 0.008,
+    strongPriceGap: 0.09,
+    maxCombinedAsk: 1.01,
+    hedgeOnlyBelowPrice: 0.36,
+    hedgeCombinedCap: 0.985,
+    minLeaderShare: 0.56,
+    maxLeaderShare: 0.79,
+    maxOneSideExposurePct: 0.79,
+    slippageBuffer: 0.0,
+    maxAvgPairPrice: 0.985,
+    maxSideSpentUsdc: 110,
+    rebalanceBand: 0.05,
+    starterTradeUsdc: 6,
+    minOppositeSeedPrice: 0.32,
+  };
 
-  maxAvgPairPrice: 0.985,
-  maxSideSpentUsdc: 110,
-  rebalanceBand: 0.05,
-  starterTradeUsdc: 6,
-  minOppositeSeedPrice: 0.32,
-};
-private st5Config: Strategy5Config = {
-  enabled: true,
-  observeSec: 9,
-  stopBeforeEndSec: 9,
-  trendWindowMs: 2000,
-  cycleMs: 2000,
-  cooldownMs: 350,
-  trendMinMove: 0.015,
-  cycleTargetTrendShares: 15,
-  trendChunkShares: 5,
-  maxOrdersPerMarket: 120,
-  slippageBuffer: 0.0,
-  maxTradePrice: 0.97,
-  maxTotalSpentUsdc: 180,
-  maxSideSpentUsdc: 120,
-};
+  private st5Config: Strategy5Config = {
+    enabled: true,
+    observeSec: 9,
+    stopBeforeEndSec: 9,
+    trendWindowMs: 2000,
+    cycleMs: 2000,
+    cooldownMs: 350,
+    trendMinMove: 0.015,
+    cycleTargetTrendShares: 15,
+    trendChunkShares: 5,
+    maxOrdersPerMarket: 120,
+    slippageBuffer: 0.0,
+    maxTradePrice: 0.97,
+    maxTotalSpentUsdc: 180,
+    maxSideSpentUsdc: 120,
+  };
 
-private st9Config: Strategy9Config = {
-  enabled: true,
-  observeSec: 7,
-  stopBeforeEndSec: 8,
-  trendWindowMs: 1800,
-  cycleMs: 3500,
-  cooldownMs: 250,
+  // ── Strategy 9 config ─────────────────────────────────────────────────────
+  // Tuned to match @vidarx BTC 5-min up/down behavior from 02-12 → 03-15 data:
+  //   • ~56.6% win-rate, ~65/35 leader/hedge split, median ~$180 total spend
+  //   • Entry within first 8s of observe → active ~232s of 300s market window
+  //   • Hard stop at 60s before end (vidarx stops at ~58-70s, never trades last minute)
+  //   • Many small orders spread over full window (not one big burst)
+  //   • Leader = higher-ask side (winner in 76% of markets per CSV analysis)
+  // ─────────────────────────────────────────────────────────────────────────
+  private st9Config: Strategy9Config = {
+    enabled: true,
 
-  trendMinMove: 0.012,
-  reversalMove: 0.03,
+    // Timing — CRITICAL fixes from old config
+    observeSec: 8,              // was 7  → 8s observe before first action
+    stopBeforeEndSec: 60,       // was 8  → vidarx stops at ~58-70s before end, NOT last 8s
 
-  minImbalance: 0.012,
-  minEdge: 0.008,
-  maxPairPrice: 0.975,
+    // Trend detection window
+    trendWindowMs: 2500,        // was 1800 → wider window, less noise for BTC 5min
+    cycleMs: 5000,              // was 3500 → longer cycles = fewer direction flips
+    cooldownMs: 300,            // was 250  → slight throttle increase
 
-  targetTrendSharesPerCycle: 280,
-  minChunkShares: 45,
-  maxChunkShares: 90,
-  hedgeChunkShares: 80,
+    // Signal sensitivity — lowered to detect leader earlier (vidarx enters fast)
+    trendMinMove: 0.009,        // was 0.012
+    reversalMove: 0.020,        // was 0.030 → easier reversal detection
 
-  slippageBuffer: 0.003,
-  maxTradePrice: 0.97,
+    minImbalance: 0.009,        // was 0.012
+    minEdge: 0.006,             // was 0.008
+    maxPairPrice: 0.985,        // was 0.975 → matches vidarx's pair tolerance (st4 uses 0.985)
 
-  maxOrdersPerMarket: 20,
-  maxTotalSpentUsdc: 140,
-  maxSideSpentUsdc: 95,
+    // Position sizing — CRITICAL fixes: old values blew full budget in 3s
+    // ~15 shares/cycle × $0.50 avg × ~20 cycles = ~$150 spread over window
+    targetTrendSharesPerCycle: 15,  // was 280 — CRITICAL
+    minChunkShares: 3,              // was 45  — CRITICAL
+    maxChunkShares: 15,             // was 90  — CRITICAL
+    hedgeChunkShares: 10,           // was 80  — CRITICAL
+    minHedgeTriggerShares: 10,      // NEW: don't hedge until 10 trend shares accumulated
 
-  flipConfirmTicks: 2,
-  scoreTrendWeight: 0.8,
-  scoreEdgeWeight: 8,
+    slippageBuffer: 0.002,          // was 0.003
+    maxTradePrice: 0.97,            // unchanged
 
-  leaderMinGap: 0.05,
-  hedgeRatio: 0.35,
-  hedgeMaxPrice: 0.36,
-  burstCount: 3,
-  burstSpacingMs: 180,
-  flipMinGap: 0.07,
-};
+    // Order/spend caps — fixed to match vidarx spend levels from CSV data
+    maxOrdersPerMarket: 65,         // was 20  → 232s window / ~3.5s avg = ~66 slots
+    maxTotalSpentUsdc: 180,         // was 140 → vidarx typically targets ~$180
+    maxSideSpentUsdc: 115,          // was 95  → 180 * 0.64 = ~115 for leader side
 
+    // Flip / confirmation — more conservative = fewer false direction changes
+    flipConfirmTicks: 4,            // was 2 → need 4 consecutive signals before flip
+    scoreTrendWeight: 0.8,          // unchanged (backward compat)
+    scoreEdgeWeight: 8,             // unchanged (backward compat)
+
+    // Leader detection — CRITICAL: old leaderMinGap 0.05 was too wide, missed early signals
+    leaderMinGap: 0.025,            // was 0.05 → detect leader on smaller gap (early entry)
+    hedgeRatio: 0.35,               // unchanged → 65/35 split matches vidarx median
+    hedgeMaxPrice: 0.44,            // was 0.36 → allow hedging up to 44¢ (old 36¢ blocked most hedges)
+    burstCount: 2,                  // was 3  → 2 bursts per cycle = more cycles overall
+    burstSpacingMs: 200,            // was 180
+    flipMinGap: 0.050,              // was 0.07 → lower flip threshold
+    
+  };
 
   private preOrdersCreated = new Map<string, boolean>();
   private isMerging = new Map<string, boolean>();
@@ -190,29 +209,6 @@ private st9Config: Strategy9Config = {
       this.logger.error(`Error fetching orders: ${error}`);
     }
   }
-
-  // @Cron(CronExpression.EVERY_MINUTE)
-  // async mergePosition() {
-  //   if (!this.currentMarketSlug) return;
-  //   const conditionId = ConditionIdContext.get(this.currentMarketSlug);
-  //   if (!conditionId) return;
-  //   if (this.isMerging.get(conditionId)) return;
-  //   const upSize = S3PositionSizeContext.get(conditionId)?.up || 0;
-  //   const downSize = S3PositionSizeContext.get(conditionId)?.down || 0;
-  //   if (upSize >= 50 && downSize >= 50) {
-  //     this.isMerging.set(conditionId, true);
-  //     const amount = upSize > downSize ? Math.floor(downSize) : Math.floor(upSize);
-  //     const hash = await this.walletService.mergeByRelayer(conditionId, amount.toFixed());
-  //     if (hash) {
-  //       this.logger.log(`${Date.now()}: [API] Merged position ${conditionId} with amount ${amount}`);
-  //       S3PositionSizeContext.set(conditionId, {
-  //         up: Math.round((S3PositionSizeContext.get(conditionId)?.up || 0 - amount) * 1000000) / 1000000,
-  //         down: Math.round((S3PositionSizeContext.get(conditionId)?.down || 0 - amount) * 1000000) / 1000000,
-  //       })
-  //     }
-  //     this.isMerging.set(conditionId, false);
-  //   }
-  // }
 
   async setPosition(conditionId: string, outcome: boolean) {
     const upSize = S3PositionSizeContext.get(conditionId)?.up || 0;
@@ -319,7 +315,6 @@ private st9Config: Strategy9Config = {
       st4MaxLeaderShare: 'maxLeaderShare',
       st4MaxOneSideExposurePct: 'maxOneSideExposurePct',
       st4SlippageBuffer: 'slippageBuffer',
-
       st4MaxAvgPairPrice: 'maxAvgPairPrice',
       st4MaxSideSpentUsdc: 'maxSideSpentUsdc',
       st4RebalanceBand: 'rebalanceBand',
@@ -327,7 +322,6 @@ private st9Config: Strategy9Config = {
       st4MinOppositeSeedPrice: 'minOppositeSeedPrice'
     };
     
-
     for (const [inputKey, configKey] of Object.entries(mapping)) {
       if (dto[inputKey] != null) {
         (this.st4Config as any)[configKey] = dto[inputKey];
@@ -335,23 +329,20 @@ private st9Config: Strategy9Config = {
     }
 
     const st5Mapping: Record<string, keyof Strategy5Config> = {
-  st5Enabled: 'enabled',
-  st5ObserveSec: 'observeSec',
-  st5StopBeforeEndSec: 'stopBeforeEndSec',
-  st5TrendWindowMs: 'trendWindowMs',
-  st5CycleMs: 'cycleMs',
-  st5CooldownMs: 'cooldownMs',
-
-  st5TrendMinMove: 'trendMinMove',
-  st5CycleTargetTrendShares: 'cycleTargetTrendShares',
-  st5MaxOrdersPerMarket: 'maxOrdersPerMarket',
-
-  st5SlippageBuffer: 'slippageBuffer',
-  st5MaxTradePrice: 'maxTradePrice',
-
-  st5MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
-  st5MaxSideSpentUsdc: 'maxSideSpentUsdc',
-};
+      st5Enabled: 'enabled',
+      st5ObserveSec: 'observeSec',
+      st5StopBeforeEndSec: 'stopBeforeEndSec',
+      st5TrendWindowMs: 'trendWindowMs',
+      st5CycleMs: 'cycleMs',
+      st5CooldownMs: 'cooldownMs',
+      st5TrendMinMove: 'trendMinMove',
+      st5CycleTargetTrendShares: 'cycleTargetTrendShares',
+      st5MaxOrdersPerMarket: 'maxOrdersPerMarket',
+      st5SlippageBuffer: 'slippageBuffer',
+      st5MaxTradePrice: 'maxTradePrice',
+      st5MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
+      st5MaxSideSpentUsdc: 'maxSideSpentUsdc',
+    };
 
     for (const [inputKey, configKey] of Object.entries(st5Mapping)) {
       if (dto[inputKey] != null) {
@@ -360,68 +351,64 @@ private st9Config: Strategy9Config = {
     }
 
     const st9Mapping: Record<string, keyof Strategy9Config> = {
-  st9Enabled: 'enabled',
-  st9ObserveSec: 'observeSec',
-  st9StopBeforeEndSec: 'stopBeforeEndSec',
-  st9TrendWindowMs: 'trendWindowMs',
-  st9CycleMs: 'cycleMs',
-  st9CooldownMs: 'cooldownMs',
-
-  st9TrendMinMove: 'trendMinMove',
-  st9ReversalMove: 'reversalMove',
-
-  st9MinImbalance: 'minImbalance',
-  st9MinEdge: 'minEdge',
-  st9MaxPairPrice: 'maxPairPrice',
-
-  st9TargetTrendSharesPerCycle: 'targetTrendSharesPerCycle',
-  st9MinChunkShares: 'minChunkShares',
-  st9MaxChunkShares: 'maxChunkShares',
-  st9HedgeChunkShares: 'hedgeChunkShares',
-
-  st9SlippageBuffer: 'slippageBuffer',
-  st9MaxTradePrice: 'maxTradePrice',
-
-  st9MaxOrdersPerMarket: 'maxOrdersPerMarket',
-  st9MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
-  st9MaxSideSpentUsdc: 'maxSideSpentUsdc',
-
-  st9FlipConfirmTicks: 'flipConfirmTicks',
-  st9ScoreTrendWeight: 'scoreTrendWeight',
-  st9ScoreEdgeWeight: 'scoreEdgeWeight',
-
-  st9LeaderMinGap: 'leaderMinGap',
-  st9HedgeRatio: 'hedgeRatio',
-  st9HedgeMaxPrice: 'hedgeMaxPrice',
-  st9BurstCount: 'burstCount',
-  st9BurstSpacingMs: 'burstSpacingMs',
-  st9FlipMinGap: 'flipMinGap',
-};
+      st9Enabled: 'enabled',
+      st9ObserveSec: 'observeSec',
+      st9StopBeforeEndSec: 'stopBeforeEndSec',
+      st9TrendWindowMs: 'trendWindowMs',
+      st9CycleMs: 'cycleMs',
+      st9CooldownMs: 'cooldownMs',
+      st9TrendMinMove: 'trendMinMove',
+      st9ReversalMove: 'reversalMove',
+      st9MinImbalance: 'minImbalance',
+      st9MinEdge: 'minEdge',
+      st9MaxPairPrice: 'maxPairPrice',
+      st9TargetTrendSharesPerCycle: 'targetTrendSharesPerCycle',
+      st9MinChunkShares: 'minChunkShares',
+      st9MaxChunkShares: 'maxChunkShares',
+      st9HedgeChunkShares: 'hedgeChunkShares',
+      st9MinHedgeTriggerShares: 'minHedgeTriggerShares',   // NEW
+      st9SlippageBuffer: 'slippageBuffer',
+      st9MaxTradePrice: 'maxTradePrice',
+      st9MaxOrdersPerMarket: 'maxOrdersPerMarket',
+      st9MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
+      st9MaxSideSpentUsdc: 'maxSideSpentUsdc',
+      st9FlipConfirmTicks: 'flipConfirmTicks',
+      st9ScoreTrendWeight: 'scoreTrendWeight',
+      st9ScoreEdgeWeight: 'scoreEdgeWeight',
+      st9LeaderMinGap: 'leaderMinGap',
+      st9HedgeRatio: 'hedgeRatio',
+      st9HedgeMaxPrice: 'hedgeMaxPrice',
+      st9BurstCount: 'burstCount',
+      st9BurstSpacingMs: 'burstSpacingMs',
+      st9FlipMinGap: 'flipMinGap',
+      
+    };
     
     for (const [inputKey, configKey] of Object.entries(st9Mapping)) {
       if (dto[inputKey] != null) {
         (this.st9Config as any)[configKey] = dto[inputKey];
       }
     }
+
     const config = this.getConfig();
     this.broadcastService.broadcast('Bot variables changed.', config);
     return config;
   }
 
   getConfig() {
-  return {
-    started: StartContext.get("start"),
-    strategy: this.strategy,
-    baseSize: this.baseSize,
-    priceThreshold: this.priceThreshold,
-    profit: this.profit,
-    rate: this.rate,
-    maxCount: this.maxCount,
-    strategy4: this.st4Config,
-    strategy5: this.st5Config,
-    strategy9: this.st9Config,
-  };
-}
+    return {
+      started: StartContext.get("start"),
+      strategy: this.strategy,
+      baseSize: this.baseSize,
+      priceThreshold: this.priceThreshold,
+      profit: this.profit,
+      rate: this.rate,
+      maxCount: this.maxCount,
+      strategy4: this.st4Config,
+      strategy5: this.st5Config,
+      strategy9: this.st9Config,
+    };
+  }
 
   async runBot(marketSlug: string, timestamp: any, tokenIdPair: any) {
       if (this.isRunning.get(marketSlug)) {
@@ -439,22 +426,6 @@ private st9Config: Strategy9Config = {
     }
     this.currentMarketSlug = marketSlug;
     try {
-      // await st_1_bot({
-      //   marketSlug, 
-      //   timestamp, 
-      //   upPrice, 
-      //   downPrice, 
-      //   config: {
-      //     baseSize: this.baseSize,
-      //     priceThreshold: this.priceThreshold,
-      //     profit: this.profit,
-      //     rate: this.rate,
-      //     maxCount: this.maxCount
-      //   },
-      //   orderService: this.orderService,
-      //   broadcastService: this.broadcastService,
-      //   logger: this.logger,
-      // });
       if (this.strategy === 1) {
         await st_1_bot({
           marketSlug,
@@ -492,7 +463,7 @@ private st9Config: Strategy9Config = {
           this.orderService, 
           this.logger
         );
-            } else if (this.strategy === 4) {
+      } else if (this.strategy === 4) {
         await st_4_bot(
           marketSlug,
           timestamp,
@@ -523,7 +494,6 @@ private st9Config: Strategy9Config = {
           this.st9Config,
         );
       }
-      
       
     } catch (error) {
       this.logger.error(`Error running bot for market ${marketSlug}: ${error.message}`);

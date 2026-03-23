@@ -22,6 +22,7 @@ export type Strategy9Config = {
   minChunkShares: number;
   maxChunkShares: number;
   hedgeChunkShares: number;
+  minHedgeTriggerShares: number;
 
   slippageBuffer: number;
   maxTradePrice: number;
@@ -31,8 +32,8 @@ export type Strategy9Config = {
   maxSideSpentUsdc: number;
 
   flipConfirmTicks: number;
-  scoreTrendWeight: number; // kept for backward compatibility
-  scoreEdgeWeight: number;  // kept for backward compatibility
+  scoreTrendWeight: number;
+  scoreEdgeWeight: number;
 
   leaderMinGap: number;
   hedgeRatio: number;
@@ -54,6 +55,7 @@ type PricePoint = {
 type MarketState = {
   firstSeenAt: number;
   lastActionAt: number;
+  lastLiveLogAt: number;
   orderCount: number;
   closed: boolean;
 
@@ -79,6 +81,7 @@ function getDefaultState(now: number): MarketState {
   return {
     firstSeenAt: now,
     lastActionAt: 0,
+    lastLiveLogAt: 0,
     orderCount: 0,
     closed: false,
 
@@ -152,11 +155,20 @@ function avgPrice(spentUsdc: number, shares: number): number {
   return spentUsdc / shares;
 }
 
-function reward(state: MarketState): number {
-  return round6(
-    Math.min(state.sharesUp, state.sharesDown) -
-      (state.spentUpUsdc + state.spentDownUsdc),
-  );
+function totalSpent(state: MarketState): number {
+  return round6(state.spentUpUsdc + state.spentDownUsdc);
+}
+
+function upReward(state: MarketState): number {
+  return round6(state.sharesUp - totalSpent(state));
+}
+
+function downReward(state: MarketState): number {
+  return round6(state.sharesDown - totalSpent(state));
+}
+
+function shouldCloseMarketByReward(state: MarketState): boolean {
+  return upReward(state) > 5 && downReward(state) > 5;
 }
 
 function oppositeSide(side: TrendSide): TrendSide {
@@ -246,21 +258,33 @@ function getLeaderSignal(params: {
   if (downMove <= -minImbalance) upStrength += 1;
   if (upMove <= -minImbalance) downStrength += 1;
 
+  if (history.length >= 3) {
+    const last3 = history.slice(-3);
+    const upConsistent =
+      last3[1].upAsk >= last3[0].upAsk &&
+      last3[2].upAsk >= last3[1].upAsk;
+    const downConsistent =
+      last3[1].downAsk >= last3[0].downAsk &&
+      last3[2].downAsk >= last3[1].downAsk;
+    if (upConsistent && !downConsistent) upStrength += 1;
+    if (downConsistent && !upConsistent) downStrength += 1;
+  }
+
   let leader: TrendDirection = 'FLAT';
 
   if (upStrength >= 2 && upStrength > downStrength) {
-  leader = 'UP';
-} else if (downStrength >= 2 && downStrength > upStrength) {
-  leader = 'DOWN';
-} else if (gap >= leaderMinGap && upMove >= -0.002) {
-  leader = 'UP';
-} else if (-gap >= leaderMinGap && downMove >= -0.002) {
-  leader = 'DOWN';
-} else if (upMove >= trendMinMove * 1.2 && gap > 0) {
-  leader = 'UP';
-} else if (downMove >= trendMinMove * 1.2 && gap < 0) {
-  leader = 'DOWN';
-}
+    leader = 'UP';
+  } else if (downStrength >= 2 && downStrength > upStrength) {
+    leader = 'DOWN';
+  } else if (gap >= leaderMinGap && upMove >= -0.002) {
+    leader = 'UP';
+  } else if (-gap >= leaderMinGap && downMove >= -0.002) {
+    leader = 'DOWN';
+  } else if (upMove >= trendMinMove * 1.2 && gap > 0) {
+    leader = 'UP';
+  } else if (downMove >= trendMinMove * 1.2 && gap < 0) {
+    leader = 'DOWN';
+  }
 
   return {
     leader,
@@ -274,8 +298,26 @@ function getLeaderSignal(params: {
 }
 
 function getBurstWeights(count: number) {
-  const base = [0.40, 0.30, 0.18, 0.12, 0.08, 0.06];
+  const base = [0.55, 0.45, 0.38, 0.30, 0.25, 0.20];
   return Array.from({ length: Math.max(1, count) }, (_, i) => base[i] ?? base[base.length - 1]);
+}
+
+function logRealtimeState(
+  logger: Logger,
+  timestamp: any,
+  marketSlug: string,
+  state: MarketState,
+  upPrice: number,
+  downPrice: number,
+  secLeft: number,
+) {
+  log(
+    logger,
+    timestamp,
+    marketSlug,
+    'LIVE',
+    `secLeft=${fmt3(secLeft)} upAsk=${fmt3(upPrice)} downAsk=${fmt3(downPrice)} sharesUp=${fmt6(state.sharesUp)} sharesDown=${fmt6(state.sharesDown)} spentUp=${fmt6(state.spentUpUsdc)} spentDown=${fmt6(state.spentDownUsdc)} totalSpent=${fmt6(totalSpent(state))} upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))} closed=${state.closed}`,
+  );
 }
 
 async function submitBuyByShares(params: {
@@ -402,14 +444,14 @@ async function buySideShares(params: {
   }
 
   const spendTry = round6(shares * askPrice);
-  const totalSpent = round6(state.spentUpUsdc + state.spentDownUsdc);
-  if (totalSpent + spendTry > config.maxTotalSpentUsdc) {
+  const currentTotalSpent = totalSpent(state);
+  if (currentTotalSpent + spendTry > config.maxTotalSpentUsdc) {
     log(
       logger,
       timestamp,
       marketSlug,
       'SKIP',
-      `total_cap_guard totalSpent=${fmt6(totalSpent)} try=${fmt6(spendTry)} max=${fmt6(config.maxTotalSpentUsdc)}`,
+      `total_cap_guard totalSpent=${fmt6(currentTotalSpent)} try=${fmt6(spendTry)} max=${fmt6(config.maxTotalSpentUsdc)}`,
     );
     return false;
   }
@@ -463,8 +505,19 @@ async function buySideShares(params: {
     timestamp,
     marketSlug,
     'STATE',
-    `pos up=${fmt6(state.sharesUp)} down=${fmt6(state.sharesDown)} spentUp=${fmt6(state.spentUpUsdc)} spentDown=${fmt6(state.spentDownUsdc)} reward=${fmt6(reward(state))}`,
+    `pos up=${fmt6(state.sharesUp)} down=${fmt6(state.sharesDown)} spentUp=${fmt6(state.spentUpUsdc)} spentDown=${fmt6(state.spentDownUsdc)} totalSpent=${fmt6(totalSpent(state))} upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))}`,
   );
+
+  if (shouldCloseMarketByReward(state)) {
+    state.closed = true;
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'STOP',
+      `reward_target_hit upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))} totalSpent=${fmt6(totalSpent(state))} market_closed=true`,
+    );
+  }
 
   return true;
 }
@@ -505,6 +558,7 @@ async function buyTrendBursts(params: {
   for (let i = 0; i < config.burstCount; i++) {
     if (remaining <= 0) break;
     if (state.orderCount >= config.maxOrdersPerMarket) break;
+    if (state.closed) break;
 
     const weight = weights[i] ?? weights[weights.length - 1];
     const ideal = round6(remainingTarget * weight);
@@ -546,6 +600,8 @@ async function buyTrendBursts(params: {
       break;
     }
 
+    if (state.closed) break;
+
     filledAny = true;
     remaining = round6(remaining - shares);
 
@@ -578,6 +634,8 @@ function shouldHedge(params: {
   const targetHedgeShares = round6(trendShares * config.hedgeRatio);
   const desired = round6(Math.max(0, targetHedgeShares - hedgeShares));
 
+  const minHedgeTrigger = config.minHedgeTriggerShares ?? 8;
+
   return {
     hedgeSide,
     trendAvg: round6(trendAvg),
@@ -588,6 +646,7 @@ function shouldHedge(params: {
     targetHedgeShares,
     desired,
     ok:
+      trendShares >= minHedgeTrigger &&
       trendAvg > 0 &&
       hedgePrice > 0 &&
       hedgePrice <= config.hedgeMaxPrice &&
@@ -637,7 +696,17 @@ export async function main(
   if (!endDate || !tokenIds) return;
 
   const secLeft = endDate - Math.floor(now / 1000);
-  if (secLeft <= config.stopBeforeEndSec) return;
+
+  if (secLeft <= config.stopBeforeEndSec) {
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'STOP',
+      `hard_stop secLeft=${fmt3(secLeft)} stopAt=${config.stopBeforeEndSec}`,
+    );
+    return;
+  }
 
   let state = strategy9State.get(marketSlug);
   if (!state) {
@@ -645,7 +714,16 @@ export async function main(
     strategy9State.set(marketSlug, state);
   }
 
-  if (state.closed) return;
+  if (state.closed) {
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'STOP',
+      `market_already_closed upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))} totalSpent=${fmt6(totalSpent(state))}`,
+    );
+    return;
+  }
 
   state.history.push({
     ts: now,
@@ -658,6 +736,19 @@ export async function main(
     Math.max(config.trendWindowMs * 4, 15_000),
   );
 
+  if (now - state.lastLiveLogAt >= 500) {
+    logRealtimeState(
+      logger,
+      timestamp,
+      marketSlug,
+      state,
+      upPrice,
+      downPrice,
+      secLeft,
+    );
+    state.lastLiveLogAt = now;
+  }
+
   const lifeSec = (now - state.firstSeenAt) / 1000;
   if (lifeSec < config.observeSec) {
     log(
@@ -665,7 +756,7 @@ export async function main(
       timestamp,
       marketSlug,
       'OBSERVE',
-      `lifeSec=${fmt3(lifeSec)} up=${fmt3(upPrice)} down=${fmt3(downPrice)}`,
+      `lifeSec=${fmt3(lifeSec)} up=${fmt3(upPrice)} down=${fmt3(downPrice)} upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))}`,
     );
     return;
   }
@@ -683,6 +774,18 @@ export async function main(
     return;
   }
 
+  if (shouldCloseMarketByReward(state)) {
+    state.closed = true;
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'STOP',
+      `reward_target_hit upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))} totalSpent=${fmt6(totalSpent(state))} market_closed=true`,
+    );
+    return;
+  }
+
   const signal = getLeaderSignal({
     history: state.history,
     trendWindowMs: config.trendWindowMs,
@@ -696,18 +799,18 @@ export async function main(
     timestamp,
     marketSlug,
     'DEBUG',
-    `leader=${signal.leader} up=${fmt3(upPrice)} down=${fmt3(downPrice)} gap=${fmt6(signal.gap)} pair=${fmt6(signal.pairPrice)} upMove=${fmt6(signal.upMove)} downMove=${fmt6(signal.downMove)} upStr=${signal.upStrength} downStr=${signal.downStrength} reward=${fmt6(reward(state))}`,
+    `leader=${signal.leader} up=${fmt3(upPrice)} down=${fmt3(downPrice)} gap=${fmt6(signal.gap)} pair=${fmt6(signal.pairPrice)} upMove=${fmt6(signal.upMove)} downMove=${fmt6(signal.downMove)} upStr=${signal.upStrength} downStr=${signal.downStrength} totalSpent=${fmt6(totalSpent(state))} upReward=${fmt6(upReward(state))} downReward=${fmt6(downReward(state))}`,
   );
 
   if (signal.pairPrice > config.maxPairPrice && state.cycleTrend === 'FLAT') {
-  log(
-    logger,
-    timestamp,
-    marketSlug,
-    'DEBUG',
-    `pair_over_limit_for_hedge_only pair=${fmt6(signal.pairPrice)} max=${fmt6(config.maxPairPrice)}`,
-  );
-}
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'DEBUG',
+      `pair_over_limit_for_hedge_only pair=${fmt6(signal.pairPrice)} max=${fmt6(config.maxPairPrice)}`,
+    );
+  }
 
   if (signal.leader === 'FLAT' && state.cycleTrend === 'FLAT') return;
 
@@ -761,13 +864,15 @@ export async function main(
   const trendAsk = trendSide === 'UP' ? upPrice : downPrice;
 
   const canTrendBuy =
-  trendAsk > 0 &&
-  trendAsk <= config.maxTradePrice &&
-  (
-    signal.leader === trendSide ||
-    state.cycleTrendShares <= 0 ||
-    cycleAgeMs <= config.cycleMs
-  );
+    trendAsk > 0 &&
+    trendAsk <= config.maxTradePrice &&
+    (
+      signal.leader === trendSide ||
+      state.cycleTrendShares <= 0 ||
+      cycleAgeMs <= config.cycleMs ||
+      (signal.leader === 'FLAT' && cycleAgeMs <= config.cycleMs * 2.0)
+    );
+
   if (
     canTrendBuy &&
     state.cycleTrendShares < config.targetTrendSharesPerCycle
@@ -784,6 +889,7 @@ export async function main(
       marketSlug,
     });
 
+    if (state.closed) return;
     if (burstOk) return;
   }
 
@@ -821,6 +927,7 @@ export async function main(
       marketSlug,
     });
 
+    if (state.closed) return;
     if (ok) return;
   }
 
