@@ -10,6 +10,7 @@ import { main as st_3_bot } from './st-3.js';
 import { Strategy4Config, main as st_4_bot, resetStrategy4State } from './st-4.js';
 import { Strategy5Config, main as st_5_bot, resetStrategy5State } from './st-5.js';
 import { Strategy9Config, main as st_9_bot, resetStrategy9State } from './st-9.js';
+import { Strategy10Config, main as st_10_bot, resetStrategy10State } from './st-10.js';
 import { ConditionIdContext, PrevPriceContext, TokenIdContext } from '../context/market.js';
 import { DATA_API_BASE, SAFE_ADDRESS } from '../constant.js';
 import { PositionSizeContext, RoundContext, S3AllPostOrderContext, S3GroupContext, S3PositionSizeContext, S3PreOrderContext, StartContext } from '../context/bot.js';
@@ -131,6 +132,62 @@ export class BotService {
     burstSpacingMs: 200,            // was 180
     flipMinGap: 0.050,              // was 0.07 → lower flip threshold
     
+  };
+
+  private st10Config: Strategy10Config = {
+    enabled: true,
+
+    observeSec: 8,
+    stopBeforeEndSec: 60,
+    trendWindowMs: 2500,
+    cycleMs: 2200,
+    cooldownMs: 180,
+
+    trendMinMove: 0.010,
+    reversalMove: 0.018,
+    minImbalance: 0.010,
+    minEdge: 0.006,
+
+    maxPairPrice: 0.985,
+    maxLivePairPrice: 1.015,
+    hedgePairPrice: 0.982,
+
+    targetTrendSharesPerCycle: 80,
+    minChunkShares: 5,
+    maxChunkShares: 40,
+    hedgeChunkShares: 40,
+    minHedgeTriggerShares: 40,
+
+    baseChildCap: 40,
+    retryMinShares: 5,
+    windowMinShares: 40,
+    windowMaxShares: 120,
+
+    slippageBuffer: 0.002,
+    maxTradePrice: 0.97,
+    maxSpread: 0.03,
+    volatilitySoftCap: 0.025,
+
+    maxOrdersPerMarket: 160,
+    maxTotalSpentUsdc: 180,
+    maxSideSpentUsdc: 120,
+
+    flipConfirmTicks: 3,
+    scoreTrendWeight: 0.8,
+    scoreEdgeWeight: 8,
+
+    leaderMinGap: 0.025,
+    hedgeRatio: 0.35,
+    hedgeMaxPrice: 0.44,
+    cheapHedgePrice: 0.36,
+    minLeaderSpendShare: 0.58,
+    maxLeaderSpendShare: 0.72,
+    burstCount: 3,
+    burstSpacingMs: 120,
+    flipMinGap: 0.05,
+    strongGap: 0.07,
+
+    closeOnBothRewardBuffer: 0,
   };
 
   private preOrdersCreated = new Map<string, boolean>();
@@ -277,6 +334,7 @@ export class BotService {
     resetStrategy4State(marketSlug);
     resetStrategy5State(marketSlug);
     resetStrategy9State(marketSlug);
+    resetStrategy10State(marketSlug);
     this.broadcastService.broadcast(`Round Reset for market`, {});
   }
 
@@ -390,6 +448,58 @@ export class BotService {
       }
     }
 
+    const st10Mapping: Record<string, keyof Strategy10Config> = {
+      st10Enabled: 'enabled',
+      st10ObserveSec: 'observeSec',
+      st10StopBeforeEndSec: 'stopBeforeEndSec',
+      st10TrendWindowMs: 'trendWindowMs',
+      st10CycleMs: 'cycleMs',
+      st10CooldownMs: 'cooldownMs',
+      st10TrendMinMove: 'trendMinMove',
+      st10ReversalMove: 'reversalMove',
+      st10MinImbalance: 'minImbalance',
+      st10MinEdge: 'minEdge',
+      st10MaxPairPrice: 'maxPairPrice',
+      st10MaxLivePairPrice: 'maxLivePairPrice',
+      st10HedgePairPrice: 'hedgePairPrice',
+      st10TargetTrendSharesPerCycle: 'targetTrendSharesPerCycle',
+      st10MinChunkShares: 'minChunkShares',
+      st10MaxChunkShares: 'maxChunkShares',
+      st10HedgeChunkShares: 'hedgeChunkShares',
+      st10MinHedgeTriggerShares: 'minHedgeTriggerShares',
+      st10BaseChildCap: 'baseChildCap',
+      st10RetryMinShares: 'retryMinShares',
+      st10WindowMinShares: 'windowMinShares',
+      st10WindowMaxShares: 'windowMaxShares',
+      st10SlippageBuffer: 'slippageBuffer',
+      st10MaxTradePrice: 'maxTradePrice',
+      st10MaxSpread: 'maxSpread',
+      st10VolatilitySoftCap: 'volatilitySoftCap',
+      st10MaxOrdersPerMarket: 'maxOrdersPerMarket',
+      st10MaxTotalSpentUsdc: 'maxTotalSpentUsdc',
+      st10MaxSideSpentUsdc: 'maxSideSpentUsdc',
+      st10FlipConfirmTicks: 'flipConfirmTicks',
+      st10ScoreTrendWeight: 'scoreTrendWeight',
+      st10ScoreEdgeWeight: 'scoreEdgeWeight',
+      st10LeaderMinGap: 'leaderMinGap',
+      st10HedgeRatio: 'hedgeRatio',
+      st10HedgeMaxPrice: 'hedgeMaxPrice',
+      st10CheapHedgePrice: 'cheapHedgePrice',
+      st10MinLeaderSpendShare: 'minLeaderSpendShare',
+      st10MaxLeaderSpendShare: 'maxLeaderSpendShare',
+      st10BurstCount: 'burstCount',
+      st10BurstSpacingMs: 'burstSpacingMs',
+      st10FlipMinGap: 'flipMinGap',
+      st10StrongGap: 'strongGap',
+      st10CloseOnBothRewardBuffer: 'closeOnBothRewardBuffer',
+    };
+
+    for (const [inputKey, configKey] of Object.entries(st10Mapping)) {
+      if (dto[inputKey] != null) {
+        (this.st10Config as any)[configKey] = dto[inputKey];
+      }
+    }
+
     const config = this.getConfig();
     this.broadcastService.broadcast('Bot variables changed.', config);
     return config;
@@ -407,6 +517,7 @@ export class BotService {
       strategy4: this.st4Config,
       strategy5: this.st5Config,
       strategy9: this.st9Config,
+      strategy10: this.st10Config,
     };
   }
 
@@ -492,6 +603,16 @@ export class BotService {
           this.orderService,
           this.logger,
           this.st9Config,
+        );
+      } else if (this.strategy === 10) {
+        await st_10_bot(
+          marketSlug,
+          timestamp,
+          upPrice,
+          downPrice,
+          this.orderService,
+          this.logger,
+          this.st10Config,
         );
       }
       

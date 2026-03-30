@@ -12,7 +12,7 @@ export const DATA_API_BASE = 'https://data-api.polymarket.com';
 export const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';
 export const WS_BASE = 'wss://ws-subscriptions-clob.polymarket.com';
 
-export const SAFE_ADDRESS = "0xaC65dF3CF050Bf56138E907777F2bBb3Ac3f7736";
+export const SAFE_ADDRESS = "0xaf8d54ff6e3dfd108b66c5851a1c78597e85c396";
 export const USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
 export const CONDITIONAL_TOKENS_FRAMEWORK_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 

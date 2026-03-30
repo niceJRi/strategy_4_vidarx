@@ -139,6 +139,37 @@ function getAcceptedOrder(response: any) {
   );
 }
 
+/**
+ * Extracts actual fill from a real Polymarket OrderResponse.
+ *   takingAmount (string) = shares received for a BUY
+ *   makingAmount (string) = USDC spent for a BUY
+ * Falls back to full requested size if the API doesn't return fill detail
+ * (e.g. paper mode responses or legacy API versions).
+ */
+function parseFillFromResponse(
+  response: any,
+  requestedShares: number,
+  askPrice: number,
+): { filledShares: number; filledUsdc: number } {
+  if (!response) return { filledShares: 0, filledUsdc: 0 };
+
+  if (response.takingAmount != null && response.makingAmount != null) {
+    const filledShares = round6(parseFloat(response.takingAmount) || 0);
+    const filledUsdc = round6(parseFloat(response.makingAmount) || 0);
+    return { filledShares, filledUsdc };
+  }
+
+  // Fallback: accepted order with no fill detail → treat as fully filled
+  if (getAcceptedOrder(response)) {
+    return {
+      filledShares: requestedShares,
+      filledUsdc: round6(requestedShares * askPrice),
+    };
+  }
+
+  return { filledShares: 0, filledUsdc: 0 };
+}
+
 function trimHistory(history: PricePoint[], now: number, maxMs: number) {
   const cutoff = now - maxMs;
   while (history.length > 0 && history[0].ts < cutoff) {
@@ -168,7 +199,7 @@ function downReward(state: MarketState): number {
 }
 
 function shouldCloseMarketByReward(state: MarketState): boolean {
-  return upReward(state) > 5 && downReward(state) > 5;
+  return upReward(state) > 1 && downReward(state) > 1;
 }
 
 function oppositeSide(side: TrendSide): TrendSide {
@@ -297,10 +328,6 @@ function getLeaderSignal(params: {
   };
 }
 
-function getBurstWeights(count: number) {
-  const base = [0.55, 0.45, 0.38, 0.30, 0.25, 0.20];
-  return Array.from({ length: Math.max(1, count) }, (_, i) => base[i] ?? base[base.length - 1]);
-}
 
 function logRealtimeState(
   logger: Logger,
@@ -330,7 +357,7 @@ async function submitBuyByShares(params: {
   logger: Logger;
   timestamp: any;
   marketSlug: string;
-}) {
+}): Promise<{ accepted: boolean; filledShares: number; filledUsdc: number }> {
   const {
     orderService,
     tokenID,
@@ -352,18 +379,18 @@ async function submitBuyByShares(params: {
       'SKIP',
       `submit_invalid side=${label} ask=${fmt3(askPrice)} shares=${fmt6(size)}`,
     );
-    return null;
+    return { accepted: false, filledShares: 0, filledUsdc: 0 };
   }
 
   const orderPrice = Math.min(0.99, round6(askPrice + slippageBuffer));
-  const usdc = round6(size * askPrice);
+  const estUsdc = round6(size * askPrice);
 
   log(
     logger,
     timestamp,
     marketSlug,
     'ACTION',
-    `BUY_SUBMIT side=${label} ask=${fmt3(askPrice)} order=${fmt3(orderPrice)} shares=${fmt6(size)} usdc=${fmt6(usdc)}`,
+    `BUY_SUBMIT side=${label} ask=${fmt3(askPrice)} order=${fmt3(orderPrice)} shares=${fmt6(size)} estUsdc=${fmt6(estUsdc)}`,
   );
 
   try {
@@ -372,28 +399,30 @@ async function submitBuyByShares(params: {
       price: orderPrice,
       side: Side.BUY,
       size,
-      orderType: OrderType.GTC,
+      orderType: OrderType.FAK,
     });
 
-    if (getAcceptedOrder(response)) {
+    const { filledShares, filledUsdc } = parseFillFromResponse(response, size, askPrice);
+
+    if (filledShares > 0) {
       log(
         logger,
         timestamp,
         marketSlug,
         'FILL',
-        `BUY_ACCEPT side=${label} ask=${fmt3(askPrice)} order=${fmt3(orderPrice)} shares=${fmt6(size)} usdc=${fmt6(usdc)}`,
+        `BUY_ACCEPT side=${label} ask=${fmt3(askPrice)} order=${fmt3(orderPrice)} filled=${fmt6(filledShares)} usdc=${fmt6(filledUsdc)} requested=${fmt6(size)}`,
       );
-    } else {
-      log(
-        logger,
-        timestamp,
-        marketSlug,
-        'SKIP',
-        `buy_failed side=${label} shares=${fmt6(size)} resp=${JSON.stringify(response)}`,
-      );
+      return { accepted: true, filledShares, filledUsdc };
     }
 
-    return response;
+    log(
+      logger,
+      timestamp,
+      marketSlug,
+      'SKIP',
+      `buy_zero_fill side=${label} shares=${fmt6(size)} resp=${JSON.stringify(response)}`,
+    );
+    return { accepted: false, filledShares: 0, filledUsdc: 0 };
   } catch (error: any) {
     log(
       logger,
@@ -402,10 +431,16 @@ async function submitBuyByShares(params: {
       'SKIP',
       `buy_error side=${label} error=${error?.message || error}`,
     );
-    return null;
+    return { accepted: false, filledShares: 0, filledUsdc: 0 };
   }
 }
 
+/**
+ * Buys `shares` on `side`. Updates state with ACTUAL filled amounts only.
+ * If the fill is partial (shortfall >= minChunkShares), immediately re-orders
+ * the remainder once before returning.
+ * Returns total actually filled shares (0 = order failed entirely).
+ */
 async function buySideShares(params: {
   state: MarketState;
   orderService: OrderService;
@@ -417,7 +452,7 @@ async function buySideShares(params: {
   logger: Logger;
   timestamp: any;
   marketSlug: string;
-}) {
+}): Promise<number> {
   const {
     state,
     orderService,
@@ -431,7 +466,7 @@ async function buySideShares(params: {
     marketSlug,
   } = params;
 
-  if (shares <= 0) return false;
+  if (shares <= 0) return 0;
   if (askPrice <= 0 || askPrice > config.maxTradePrice) {
     log(
       logger,
@@ -440,7 +475,7 @@ async function buySideShares(params: {
       'SKIP',
       `price_guard side=${side} ask=${fmt3(askPrice)} maxTradePrice=${fmt3(config.maxTradePrice)}`,
     );
-    return false;
+    return 0;
   }
 
   const spendTry = round6(shares * askPrice);
@@ -453,7 +488,7 @@ async function buySideShares(params: {
       'SKIP',
       `total_cap_guard totalSpent=${fmt6(currentTotalSpent)} try=${fmt6(spendTry)} max=${fmt6(config.maxTotalSpentUsdc)}`,
     );
-    return false;
+    return 0;
   }
 
   const sideSpent = getSideSpent(state, side);
@@ -465,12 +500,13 @@ async function buySideShares(params: {
       'SKIP',
       `side_cap_guard side=${side} sideSpent=${fmt6(sideSpent)} try=${fmt6(spendTry)} max=${fmt6(config.maxSideSpentUsdc)}`,
     );
-    return false;
+    return 0;
   }
 
   const tokenID = side === 'UP' ? tokenIds.up : tokenIds.down;
 
-  const response = await submitBuyByShares({
+  // ── Primary order ──────────────────────────────────────────────────────────
+  const result = await submitBuyByShares({
     orderService,
     tokenID,
     askPrice,
@@ -482,22 +518,69 @@ async function buySideShares(params: {
     marketSlug,
   });
 
-  if (!getAcceptedOrder(response)) return false;
+  if (!result.accepted) return 0;
 
-  if (side === 'UP') {
-    state.sharesUp = round6(state.sharesUp + shares);
-    state.spentUpUsdc = round6(state.spentUpUsdc + spendTry);
-  } else {
-    state.sharesDown = round6(state.sharesDown + shares);
-    state.spentDownUsdc = round6(state.spentDownUsdc + spendTry);
+  let totalFilled = result.filledShares;
+  let totalFilledUsdc = result.filledUsdc;
+  state.orderCount += 1;
+
+  // ── Immediate re-order for shortfall ──────────────────────────────────────
+  const shortfall = round6(shares - result.filledShares);
+  if (shortfall >= Math.max(config.minChunkShares, 0.5)) {
+    const shortfallSpend = round6(shortfall * askPrice);
+    const newTotalSpent = totalSpent(state) + totalFilledUsdc;
+    const newSideSpent = getSideSpent(state, side) + totalFilledUsdc;
+
+    const canReorder =
+      state.orderCount < config.maxOrdersPerMarket &&
+      newTotalSpent + shortfallSpend <= config.maxTotalSpentUsdc &&
+      newSideSpent + shortfallSpend <= config.maxSideSpentUsdc;
+
+    if (canReorder) {
+      log(
+        logger,
+        timestamp,
+        marketSlug,
+        'REORDER',
+        `side=${side} shortfall=${fmt6(shortfall)} filled=${fmt6(result.filledShares)} requested=${fmt6(shares)}`,
+      );
+
+      const reResult = await submitBuyByShares({
+        orderService,
+        tokenID,
+        askPrice,
+        shares: shortfall,
+        slippageBuffer: config.slippageBuffer,
+        label: side,
+        logger,
+        timestamp,
+        marketSlug,
+      });
+
+      if (reResult.accepted && reResult.filledShares > 0) {
+        totalFilled = round6(totalFilled + reResult.filledShares);
+        totalFilledUsdc = round6(totalFilledUsdc + reResult.filledUsdc);
+        state.orderCount += 1;
+      }
+    }
   }
 
-  state.orderCount += 1;
+  // ── Update state with ACTUAL fills only ───────────────────────────────────
+  if (totalFilled <= 0) return 0;
+
+  if (side === 'UP') {
+    state.sharesUp = round6(state.sharesUp + totalFilled);
+    state.spentUpUsdc = round6(state.spentUpUsdc + totalFilledUsdc);
+  } else {
+    state.sharesDown = round6(state.sharesDown + totalFilled);
+    state.spentDownUsdc = round6(state.spentDownUsdc + totalFilledUsdc);
+  }
+
   state.lastActionAt = Date.now();
 
   if (state.cycleTrend === side) {
-    state.cycleTrendShares = round6(state.cycleTrendShares + shares);
-    state.cycleTrendSpentUsdc = round6(state.cycleTrendSpentUsdc + spendTry);
+    state.cycleTrendShares = round6(state.cycleTrendShares + totalFilled);
+    state.cycleTrendSpentUsdc = round6(state.cycleTrendSpentUsdc + totalFilledUsdc);
   }
 
   log(
@@ -519,7 +602,7 @@ async function buySideShares(params: {
     );
   }
 
-  return true;
+  return totalFilled;
 }
 
 async function buyTrendBursts(params: {
@@ -532,83 +615,57 @@ async function buyTrendBursts(params: {
   logger: Logger;
   timestamp: any;
   marketSlug: string;
-}) {
-  const {
-    state,
-    orderService,
-    tokenIds,
-    side,
-    askPrice,
-    config,
-    logger,
-    timestamp,
-    marketSlug,
-  } = params;
+}): Promise<boolean> {
+  const { state, config, logger, timestamp, marketSlug } = params;
 
-  const remainingTarget = round6(
-    config.targetTrendSharesPerCycle - state.cycleTrendShares,
-  );
-
-  if (remainingTarget <= 0) return false;
-
-  const weights = getBurstWeights(config.burstCount);
-  let remaining = remainingTarget;
   let filledAny = false;
+  let consecutiveZeros = 0;
+  const MAX_ZEROS = 2;
 
-  for (let i = 0; i < config.burstCount; i++) {
-    if (remaining <= 0) break;
-    if (state.orderCount >= config.maxOrdersPerMarket) break;
+  while (true) {
     if (state.closed) break;
+    if (state.orderCount >= config.maxOrdersPerMarket) break;
 
-    const weight = weights[i] ?? weights[weights.length - 1];
-    const ideal = round6(remainingTarget * weight);
+    const remaining = round6(config.targetTrendSharesPerCycle - state.cycleTrendShares);
+    if (remaining <= 0) {
+      log(logger, timestamp, marketSlug, 'CYCLE_DONE',
+        `side=${params.side} target=${fmt6(config.targetTrendSharesPerCycle)} filled=${fmt6(state.cycleTrendShares)}`);
+      break;
+    }
 
-    let shares = round6(
-      clamp(
-        ideal,
-        Math.min(config.minChunkShares, Math.max(remaining, 0.000001)),
-        config.maxChunkShares,
-      ),
-    );
+    const chunk = round6(clamp(remaining, config.minChunkShares, config.maxChunkShares));
+    if (chunk < config.minChunkShares) break;
 
-    shares = round6(Math.min(shares, remaining));
-    if (shares <= 0) break;
+    log(logger, timestamp, marketSlug, 'BURST',
+      `side=${params.side} chunk=${fmt6(chunk)} remaining=${fmt6(remaining)} zeros=${consecutiveZeros}`);
 
-    log(
-      logger,
-      timestamp,
-      marketSlug,
-      'BURST',
-      `side=${side} idx=${i + 1}/${config.burstCount} shares=${fmt6(shares)} remainingBefore=${fmt6(remaining)}`,
-    );
-
-    const ok = await buySideShares({
-      state,
-      orderService,
-      tokenIds,
-      side,
-      askPrice,
-      shares,
-      config,
+    const filled = await buySideShares({
+      state: params.state,
+      orderService: params.orderService,
+      tokenIds: params.tokenIds,
+      side: params.side,
+      askPrice: params.askPrice,
+      shares: chunk,
+      config: params.config,
       logger,
       timestamp,
       marketSlug,
     });
 
-    if (!ok) {
-      if (!filledAny) return false;
-      break;
+    if (filled <= 0) {
+      consecutiveZeros++;
+      if (consecutiveZeros >= MAX_ZEROS) {
+        log(logger, timestamp, marketSlug, 'BURST_STOP',
+          `no_fill_x${consecutiveZeros} side=${params.side} remaining=${fmt6(remaining)}`);
+        break;
+      }
+    } else {
+      consecutiveZeros = 0;
+      filledAny = true;
     }
 
     if (state.closed) break;
-
-    filledAny = true;
-    remaining = round6(remaining - shares);
-
-    if (remaining <= 0) break;
-    if (i < config.burstCount - 1 && config.burstSpacingMs > 0) {
-      await sleep(config.burstSpacingMs);
-    }
+    if (config.burstSpacingMs > 0) await sleep(config.burstSpacingMs);
   }
 
   return filledAny;
@@ -914,7 +971,7 @@ export async function main(
       `trend=${trendSide} hedge=${hedgeCheck.hedgeSide} trendAvg=${fmt6(hedgeCheck.trendAvg)} hedgeAsk=${fmt6(hedgeCheck.hedgePrice)} edge=${fmt6(hedgeCheck.edge)} trendShares=${fmt6(hedgeCheck.trendShares)} hedgeShares=${fmt6(hedgeCheck.hedgeShares)} targetHedge=${fmt6(hedgeCheck.targetHedgeShares)} chunk=${fmt6(hedgeShares)}`,
     );
 
-    const ok = await buySideShares({
+    const hedgeFilled = await buySideShares({
       state,
       orderService,
       tokenIds,
@@ -928,7 +985,7 @@ export async function main(
     });
 
     if (state.closed) return;
-    if (ok) return;
+    if (hedgeFilled > 0) return;
   }
 
   if (cycleAgeMs > config.cycleMs * 1.4 && signal.leader !== 'FLAT' && signal.leader !== state.cycleTrend) {

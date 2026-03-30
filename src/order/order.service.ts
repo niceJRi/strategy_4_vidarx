@@ -1,18 +1,25 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
-  OpenOrder,
+  ClobClient,
   OrderType,
   PostOrdersArgs,
+  OpenOrder,
   Side,
 } from '@polymarket/clob-client';
 import { SignedOrder } from '@polymarket/order-utils';
-import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
 import { S3PreOrderContext } from '../context/bot.js';
 import {
-  PriceContext,
+  signer,
+  CLOB_API_BASE,
+  SAFE_ADDRESS,
+  POLY_BUILDER_API_KEY,
+  POLY_BUILDER_SECRET,
+  POLY_BUILDER_PASSPHRASE,
+} from '../constant.js';
+import {
   TokenIdContext,
   ConditionIdContext,
   EndDateContext,
@@ -25,7 +32,7 @@ export interface CreateAndPostOrderParams {
   price: number;
   side: Side;
   size: number;
-  orderType?: OrderType.GTC | OrderType.GTD;
+  orderType?: OrderType.GTC | OrderType.GTD | OrderType.FAK | OrderType.FOK;
 }
 
 export interface CreateOrderParams {
@@ -39,7 +46,7 @@ export interface CreateOrderParams {
 
 export interface CreateMarketOrderParams {
   tokenID: string;
-  price: number;
+  price?: number;
   side: Side;
   amount: number;
   orderType?: OrderType.FOK | OrderType.FAK;
@@ -47,34 +54,7 @@ export interface CreateMarketOrderParams {
 
 type OutcomeSide = 'up' | 'down';
 
-type FakeOrderPayload = {
-  salt: string;
-  maker: string;
-  signer: string;
-  taker: string;
-  tokenId: string;
-  tokenID: string;
-  price: number;
-  side: Side;
-  size: number;
-};
-
-type FakeLiveOrder = {
-  id: string;
-  market: string; // conditionId
-  marketSlug: string;
-  tokenID: string;
-  outcome: OutcomeSide;
-  side: Side;
-  price: number;
-  size: number;
-  remainingSize: number;
-  createdAt: number;
-  updatedAt: number;
-  status: 'live';
-};
-
-type MarketPaperStats = {
+type MarketTradeStats = {
   marketSlug: string;
   conditionId: string;
   upShares: number;
@@ -91,547 +71,257 @@ type MarketPaperStats = {
 @Injectable()
 export class OrderService {
   private readonly logger = new Logger(OrderService.name);
-  private readonly liveOrders = new Map<string, FakeLiveOrder>();
-  private readonly marketStats = new Map<string, MarketPaperStats>();
+  private clobClient: ClobClient;
+  private readonly marketStats = new Map<string, MarketTradeStats>();
   private readonly settleInFlight = new Set<string>();
 
   private readonly logsDir = path.join(process.cwd(), 'logs');
   private readonly marketResultLogPath = path.join(
     process.cwd(),
     'logs',
-    'paper-market-results.csv',
+    'market-results.csv',
   );
 
   async onModuleInit() {
-    this.ensureBaseLogFiles();
+    // signatureType=1 → POLY_PROXY mode:
+    //   maker  = Polymarket proxy wallet (0xaf8d54ff6e3dfd108b66c5851a1c78597e85c396)
+    //   signer = EOA MetaMask key (0x38c31aFd3655973041D6E5A0151Eb5a55CD2d893)
+    // USDC is drawn from the proxy wallet (your Polymarket account balance).
+    const PROXY_WALLET = '0xaf8d54ff6e3dfd108b66c5851a1c78597e85c396';
+    const creds = {
+      key: POLY_BUILDER_API_KEY,
+      secret: POLY_BUILDER_SECRET,
+      passphrase: POLY_BUILDER_PASSPHRASE,
+    };
+    this.clobClient = new ClobClient(CLOB_API_BASE, 137, signer, creds, 2, PROXY_WALLET);
 
-    this.logger.log(
-      '[FAKE ORDER MODE] initialized with real best bid/ask + per-market paper trade logs',
-    );
+    this.ensureBaseLogFiles();
+    this.logger.log('[REAL ORDER MODE] initialized with live Polymarket CLOB');
 
     setInterval(() => {
       this.checkAndSettleEndedMarkets().catch((error) => {
-        this.logger.error(`Error settling ended paper markets: ${error}`);
+        this.logger.error(`Error settling markets: ${error}`);
       });
     }, 5000);
   }
 
+  // ── Order creation ────────────────────────────────────────────────────────
+
   async createOrder(params: CreateOrderParams): Promise<SignedOrder> {
     try {
       const { key, tokenID, price, side, size } = params;
-
-      const order: FakeOrderPayload = {
-        salt: randomUUID(),
-        maker: 'paper-maker',
-        signer: 'paper-signer',
-        taker: '0x0000000000000000000000000000000000000000',
-        tokenId: tokenID,
+      const order = await this.clobClient.createOrder({
         tokenID,
         price,
         side,
         size,
-      };
-
-      S3PreOrderContext.set(key, order as unknown as SignedOrder);
-      return order as unknown as SignedOrder;
+      });
+      S3PreOrderContext.set(key, order);
+      return order;
     } catch (error) {
-      this.logger.error(`Error creating fake order: ${error}`);
+      this.logger.error(`Error creating order: ${error}`);
       throw error;
     }
   }
 
   async postOrder(order: SignedOrder, orderType: OrderType): Promise<any> {
-    const results = await this.postOrders([{ order, orderType }]);
-    return results?.[0];
-  }
-
-  async postOrders(orders: PostOrdersArgs[]): Promise<any[]> {
     try {
-      const responses: any[] = [];
-
-      for (const item of orders) {
-        const raw = item.order as unknown as Partial<FakeOrderPayload> & {
-          tokenId?: string;
-          tokenID?: string;
-          price?: number | string;
-          side?: Side;
-          size?: number | string;
-        };
-
-        const tokenID = raw.tokenID || raw.tokenId;
-        const price = Number(raw.price);
-        const side = raw.side;
-        const size = Number(raw.size);
-
-        if (!tokenID || !side || Number.isNaN(price) || Number.isNaN(size)) {
-          responses.push({
-            success: false,
-            status: 'rejected',
-            error: 'invalid_fake_order_payload',
-          });
-          continue;
-        }
-
-        const meta = this.resolveTokenMeta(tokenID);
-        if (!meta) {
-          responses.push({
-            success: false,
-            status: 'rejected',
-            error: 'unknown_token_id',
-          });
-          continue;
-        }
-
-        this.ensureMarketStats(meta.marketSlug, meta.conditionId);
-        this.ensureTradeLogFile(meta.marketSlug);
-
-        const priceState = PriceContext.get(tokenID);
-        const bestAsk = priceState?.bestAsk;
-        const bestBid = priceState?.bestBid;
-
-        const isImmediatelyMatched = this.isMarketable({
-          side,
-          price,
-          bestAsk,
-          bestBid,
-        });
-
-        if (isImmediatelyMatched) {
-          const orderID = `fake-${randomUUID()}`;
-          const fillPrice =
-            side === Side.BUY
-              ? (bestAsk ?? price)
-              : side === Side.SELL
-                ? (bestBid ?? price)
-                : price;
-
-          this.recordFill({
-            marketSlug: meta.marketSlug,
-            conditionId: meta.conditionId,
-            tokenId: tokenID,
-            outcome: meta.outcome,
-            side,
-            fillPrice,
-            size,
-            bestBid,
-            bestAsk,
-            orderId: orderID,
-            notes: 'matched_at_submit',
-          });
-
-          responses.push({
-            success: true,
-            status: 'matched',
-            orderID,
-            makingAmount: size.toFixed(6),
-            price: fillPrice,
-            tokenID,
-            outcome: meta.outcome,
-          });
-          continue;
-        }
-
-        const fakeId = `fake-${randomUUID()}`;
-        const liveOrder: FakeLiveOrder = {
-          id: fakeId,
-          market: meta.conditionId,
-          marketSlug: meta.marketSlug,
-          tokenID,
-          outcome: meta.outcome,
-          side,
-          price,
-          size,
-          remainingSize: size,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          status: 'live',
-        };
-
-        this.liveOrders.set(fakeId, liveOrder);
-
-        this.appendTradeLog(meta.marketSlug, {
-          event: 'ORDER_LIVE',
-          marketSlug: meta.marketSlug,
-          conditionId: meta.conditionId,
-          tokenId: tokenID,
-          outcome: meta.outcome,
-          side,
-          orderPrice: price,
-          size,
-          bestBid,
-          bestAsk,
-          orderId: fakeId,
-          notes: 'accepted_into_paper_book',
-        });
-
-        responses.push({
-          success: true,
-          status: 'live',
-          orderID: fakeId,
-          price,
-          tokenID,
-          outcome: meta.outcome,
-        });
-      }
-
-      return responses;
+      return await this.clobClient.postOrder(order, orderType);
     } catch (error) {
-      this.logger.error(`Error posting fake orders: ${error}`);
-      return [];
+      this.logger.error(`Error posting order: ${error}`);
     }
   }
 
+  async postOrders(orders: PostOrdersArgs[]): Promise<any> {
+    try {
+      return await this.clobClient.postOrders(orders);
+    } catch (error) {
+      this.logger.error(`Error posting orders: ${error}`);
+    }
+  }
+
+  /**
+   * Creates and posts a single limit order.
+   * Returns the raw OrderResponse from the CLOB API:
+   *   { success, orderID, status, takingAmount (shares filled), makingAmount (USDC spent) }
+   */
   async createAndPostOrder(params: CreateAndPostOrderParams): Promise<any> {
     try {
-      const fakeOrder: FakeOrderPayload = {
-        salt: randomUUID(),
-        maker: 'paper-maker',
-        signer: 'paper-signer',
-        taker: '0x0000000000000000000000000000000000000000',
-        tokenId: params.tokenID,
-        tokenID: params.tokenID,
-        price: params.price,
-        side: params.side,
-        size: params.size,
-      };
+      const { tokenID, price, side, size, orderType = OrderType.GTC } = params;
 
-      return await this.postOrder(
-        fakeOrder as unknown as SignedOrder,
-        params.orderType ?? OrderType.GTC,
+      let response: any;
+      if (orderType === OrderType.FAK || orderType === OrderType.FOK) {
+        const amount = Math.round(size * price * 1_000_000) / 1_000_000;
+        response = await this.clobClient.createAndPostMarketOrder(
+          { tokenID, price, side, amount, orderType },
+          null,
+          orderType as OrderType.FAK | OrderType.FOK,
+        );
+      } else {
+        response = await this.clobClient.createAndPostOrder(
+          { tokenID, price, side, size },
+          null,
+          orderType as OrderType.GTC | OrderType.GTD,
+        );
+      }
+
+      // Best-effort trade logging for audit trail + P&L settlement
+      this.tryRecordFill(tokenID, side, price, size, response);
+
+      return response;
+    } catch (error) {
+      this.logger.error(`Error creating and posting order: ${error}`);
+    }
+  }
+
+  async createAndPostMarketOrder(
+    params: CreateMarketOrderParams,
+    orderType: OrderType.FOK | OrderType.FAK = OrderType.FOK,
+  ): Promise<any> {
+    try {
+      const { tokenID, price, side, amount } = params;
+      return await this.clobClient.createAndPostMarketOrder(
+        { tokenID, price, side, amount, orderType },
+        null,
+        orderType,
       );
     } catch (error) {
-      this.logger.error(`Error createAndPostOrder in fake mode: ${error}`);
+      this.logger.error(`Error creating and posting market order: ${error}`);
     }
   }
 
-  async createMarketOrder(params: CreateMarketOrderParams): Promise<any> {
+  async createOrders(
+    orders: CreateAndPostOrderParams[],
+    orderType: OrderType.GTC | OrderType.GTD = OrderType.GTC,
+  ): Promise<any> {
     try {
-      const tokenID = params.tokenID;
-      const amount = Number(params.amount);
-      const priceState = PriceContext.get(tokenID);
-      const meta = this.resolveTokenMeta(tokenID);
-
-      if (!meta) {
-        return {
-          success: false,
-          status: 'rejected',
-          error: 'unknown_token_id',
-        };
-      }
-
-      if (!priceState) {
-        return {
-          success: false,
-          status: 'rejected',
-          error: 'no_live_price',
-        };
-      }
-
-      this.ensureMarketStats(meta.marketSlug, meta.conditionId);
-      this.ensureTradeLogFile(meta.marketSlug);
-
-      const fillPrice =
-        params.side === Side.BUY ? priceState.bestAsk : priceState.bestBid;
-
-      if (fillPrice == null || Number.isNaN(fillPrice)) {
-        return {
-          success: false,
-          status: 'rejected',
-          error: 'bad_touch_price',
-        };
-      }
-
-      const orderID = `fake-${randomUUID()}`;
-
-      this.recordFill({
-        marketSlug: meta.marketSlug,
-        conditionId: meta.conditionId,
-        tokenId: tokenID,
-        outcome: meta.outcome,
-        side: params.side,
-        fillPrice,
-        size: amount,
-        bestBid: priceState.bestBid,
-        bestAsk: priceState.bestAsk,
-        orderId: orderID,
-        notes: 'market_order_fake_fill',
-      });
-
-      return {
-        success: true,
-        status: 'matched',
-        orderID,
-        makingAmount: amount.toFixed(6),
-        price: fillPrice,
-        tokenID,
-        outcome: meta.outcome,
-      };
+      const orderArgs: PostOrdersArgs[] = await Promise.all(
+        orders.map(async ({ tokenID, price, side, size }) => {
+          const order = await this.clobClient.createOrder({
+            tokenID,
+            price,
+            side,
+            size,
+          });
+          return { order, orderType };
+        }),
+      );
+      return await this.clobClient.postOrders(orderArgs);
     } catch (error) {
-      this.logger.error(`Error creating fake market order: ${error}`);
+      this.logger.error(`Error creating orders: ${error}`);
     }
   }
 
-  async createOrders(orders: CreateAndPostOrderParams[]): Promise<any> {
-    try {
-      const payload: PostOrdersArgs[] = orders.map((params) => {
-        const fakeOrder: FakeOrderPayload = {
-          salt: randomUUID(),
-          maker: 'paper-maker',
-          signer: 'paper-signer',
-          taker: '0x0000000000000000000000000000000000000000',
-          tokenId: params.tokenID,
-          tokenID: params.tokenID,
-          price: params.price,
-          side: params.side,
-          size: params.size,
-        };
-
-        return {
-          order: fakeOrder as unknown as SignedOrder,
-          orderType: params.orderType ?? OrderType.GTC,
-        };
-      });
-
-      return await this.postOrders(payload);
-    } catch (error) {
-      this.logger.error(`Error creating fake orders: ${error}`);
-    }
-  }
+  // ── Order management ──────────────────────────────────────────────────────
 
   async cancelOrder(orderID: string): Promise<any> {
     try {
-      const existing = this.liveOrders.get(orderID);
-      const existed = this.liveOrders.delete(orderID);
-
-      if (existed && existing) {
-        const priceState = PriceContext.get(existing.tokenID);
-        this.ensureTradeLogFile(existing.marketSlug);
-
-        this.appendTradeLog(existing.marketSlug, {
-          event: 'ORDER_CANCELED',
-          marketSlug: existing.marketSlug,
-          conditionId: existing.market,
-          tokenId: existing.tokenID,
-          outcome: existing.outcome,
-          side: existing.side,
-          orderPrice: existing.price,
-          size: existing.remainingSize,
-          bestBid: priceState?.bestBid,
-          bestAsk: priceState?.bestAsk,
-          orderId: existing.id,
-          notes: 'manual_cancel',
-        });
-      }
-
-      return {
-        success: existed,
-        canceled: existed,
-        orderID,
-      };
+      return await this.clobClient.cancelOrder({ orderID });
     } catch (error) {
-      this.logger.error(`Error canceling fake order: ${error}`);
+      this.logger.error(`Error canceling order: ${error}`);
     }
   }
 
   async cancelOrders(orderIDs: string[]): Promise<any> {
     try {
-      const canceled: string[] = [];
-
-      for (const id of orderIDs) {
-        const existing = this.liveOrders.get(id);
-
-        if (this.liveOrders.delete(id)) {
-          canceled.push(id);
-
-          if (existing) {
-            const priceState = PriceContext.get(existing.tokenID);
-            this.ensureTradeLogFile(existing.marketSlug);
-
-            this.appendTradeLog(existing.marketSlug, {
-              event: 'ORDER_CANCELED',
-              marketSlug: existing.marketSlug,
-              conditionId: existing.market,
-              tokenId: existing.tokenID,
-              outcome: existing.outcome,
-              side: existing.side,
-              orderPrice: existing.price,
-              size: existing.remainingSize,
-              bestBid: priceState?.bestBid,
-              bestAsk: priceState?.bestAsk,
-              orderId: existing.id,
-              notes: 'batch_cancel',
-            });
-          }
-        }
-      }
-
-      return {
-        success: true,
-        canceled,
-      };
+      return await this.clobClient.cancelOrders(orderIDs);
     } catch (error) {
-      this.logger.error(`Error canceling fake orders: ${error}`);
+      this.logger.error(`Error canceling orders: ${error}`);
     }
   }
 
   async cancelAllOrders(): Promise<any> {
     try {
-      const existingOrders = Array.from(this.liveOrders.values());
-
-      for (const order of existingOrders) {
-        const priceState = PriceContext.get(order.tokenID);
-        this.ensureTradeLogFile(order.marketSlug);
-
-        this.appendTradeLog(order.marketSlug, {
-          event: 'ORDER_CANCELED',
-          marketSlug: order.marketSlug,
-          conditionId: order.market,
-          tokenId: order.tokenID,
-          outcome: order.outcome,
-          side: order.side,
-          orderPrice: order.price,
-          size: order.remainingSize,
-          bestBid: priceState?.bestBid,
-          bestAsk: priceState?.bestAsk,
-          orderId: order.id,
-          notes: 'cancel_all',
-        });
-      }
-
-      const count = this.liveOrders.size;
-      this.liveOrders.clear();
-
-      return {
-        success: true,
-        canceledCount: count,
-      };
+      return await this.clobClient.cancelAll();
     } catch (error) {
-      this.logger.error(`Error canceling all fake orders: ${error}`);
+      this.logger.error(`Error canceling all orders: ${error}`);
     }
   }
 
   async getOrders(market: string): Promise<OpenOrder[]> {
     try {
-      this.refreshLiveOrdersAgainstRealPrices(market);
-
-      return Array.from(this.liveOrders.values())
-        .filter((order) => order.market === market)
-        .map((order) => this.toOpenOrder(order));
+      return await this.clobClient.getOpenOrders({ market });
     } catch (error) {
-      this.logger.error(`Error fetching fake open orders: ${error}`);
+      this.logger.error(`Error fetching open orders: ${error}`);
       return [];
     }
   }
 
-  private refreshLiveOrdersAgainstRealPrices(conditionId: string) {
-    for (const [id, order] of this.liveOrders.entries()) {
-      if (order.market !== conditionId) continue;
+  // ── Trade logging & P&L settlement ───────────────────────────────────────
 
-      const priceState = PriceContext.get(order.tokenID);
-      if (!priceState) continue;
+  /**
+   * Extracts the actual fill from a real OrderResponse and records it.
+   * OrderResponse fields:
+   *   takingAmount (string) = shares received for a BUY
+   *   makingAmount (string) = USDC spent for a BUY
+   */
+  private tryRecordFill(
+    tokenID: string,
+    side: Side,
+    price: number,
+    requestedSize: number,
+    response: any,
+  ) {
+    try {
+      if (!response) return;
+      const meta = this.resolveTokenMeta(tokenID);
+      if (!meta) return;
 
-      const shouldFillNow = this.isMarketable({
-        side: order.side,
-        price: order.price,
-        bestAsk: priceState.bestAsk,
-        bestBid: priceState.bestBid,
+      let filledShares = 0;
+      let filledUsdc = 0;
+
+      if (response.takingAmount != null && response.makingAmount != null) {
+        filledShares = parseFloat(response.takingAmount) || 0;
+        filledUsdc = parseFloat(response.makingAmount) || 0;
+      } else if (response.success !== false && response.orderID) {
+        // API didn't return fill amounts — assume full fill for logging
+        filledShares = requestedSize;
+        filledUsdc = requestedSize * price;
+      }
+
+      // Only record orders that actually filled — FAK zero-fill = cancelled
+      if (filledShares <= 0) return;
+
+      this.ensureTradeLogFile(meta.marketSlug);
+
+      this.appendTradeLog(meta.marketSlug, {
+        event: 'ORDER_FILLED',
+        marketSlug: meta.marketSlug,
+        conditionId: meta.conditionId,
+        tokenId: tokenID,
+        outcome: meta.outcome,
+        side,
+        orderPrice: price,
+        size: filledShares,
+        orderId: response.orderID || response.orderId || '',
+        notes: `status=${response.status ?? 'unknown'} takingAmount=${response.takingAmount ?? ''} makingAmount=${response.makingAmount ?? ''}`,
       });
 
-      if (shouldFillNow) {
-        const fillPrice =
-          order.side === Side.BUY
-            ? (priceState.bestAsk ?? order.price)
-            : (priceState.bestBid ?? order.price);
-
-        this.recordFill({
-          marketSlug: order.marketSlug,
-          conditionId: order.market,
-          tokenId: order.tokenID,
-          outcome: order.outcome,
-          side: order.side,
-          fillPrice,
-          size: order.remainingSize,
-          bestBid: priceState.bestBid,
-          bestAsk: priceState.bestAsk,
-          orderId: order.id,
-          notes:
-            order.side === Side.BUY
-              ? 'filled_by_real_best_ask'
-              : 'filled_by_real_best_bid',
-        });
-
-        this.liveOrders.delete(id);
+      if (side === Side.BUY && filledShares > 0) {
+        const stats = this.ensureMarketStats(meta.marketSlug, meta.conditionId);
+        if (meta.outcome === 'up') {
+          stats.upShares += filledShares;
+          stats.upCostUsdc += filledUsdc;
+          stats.upFillCount += 1;
+        } else {
+          stats.downShares += filledShares;
+          stats.downCostUsdc += filledUsdc;
+          stats.downFillCount += 1;
+        }
       }
+    } catch {
+      // Best-effort — never throw from a logging helper
     }
-  }
-
-  private recordFill(params: {
-    marketSlug: string;
-    conditionId: string;
-    tokenId: string;
-    outcome: OutcomeSide;
-    side: Side;
-    fillPrice: number;
-    size: number;
-    bestBid?: number;
-    bestAsk?: number;
-    orderId: string;
-    notes?: string;
-  }) {
-    const {
-      marketSlug,
-      conditionId,
-      tokenId,
-      outcome,
-      side,
-      fillPrice,
-      size,
-      bestBid,
-      bestAsk,
-      orderId,
-      notes,
-    } = params;
-
-    this.ensureTradeLogFile(marketSlug);
-
-    if (side === Side.BUY) {
-      const stats = this.ensureMarketStats(marketSlug, conditionId);
-
-      if (outcome === 'up') {
-        stats.upShares += size;
-        stats.upCostUsdc += fillPrice * size;
-        stats.upFillCount += 1;
-      } else {
-        stats.downShares += size;
-        stats.downCostUsdc += fillPrice * size;
-        stats.downFillCount += 1;
-      }
-    }
-
-    this.appendTradeLog(marketSlug, {
-      event: 'ORDER_FILLED',
-      marketSlug,
-      conditionId,
-      tokenId,
-      outcome,
-      side,
-      orderPrice: fillPrice,
-      size,
-      bestBid,
-      bestAsk,
-      orderId,
-      notes: notes ?? '',
-    });
   }
 
   private ensureMarketStats(
     marketSlug: string,
     conditionId: string,
-  ): MarketPaperStats {
+  ): MarketTradeStats {
     const existing = this.marketStats.get(marketSlug);
     if (existing) return existing;
 
-    const created: MarketPaperStats = {
+    const created: MarketTradeStats = {
       marketSlug,
       conditionId,
       upShares: 0,
@@ -658,20 +348,16 @@ export class OrderService {
       if (!endDateRaw) continue;
 
       const endMs = new Date(endDateRaw).getTime();
-      if (!Number.isFinite(endMs)) continue;
-      if (now < endMs) continue;
+      if (!Number.isFinite(endMs) || now < endMs) continue;
 
       this.settleInFlight.add(marketSlug);
 
       try {
         const winner = await this.fetchWinnerForMarket(marketSlug);
         if (!winner) continue;
-
         this.finalizeMarket(stats, winner);
       } catch (error) {
-        this.logger.error(
-          `Error finalizing paper market ${marketSlug}: ${error}`,
-        );
+        this.logger.error(`Error finalizing market ${marketSlug}: ${error}`);
       } finally {
         this.settleInFlight.delete(marketSlug);
       }
@@ -682,21 +368,12 @@ export class OrderService {
     marketSlug: string,
   ): Promise<OutcomeSide | null> {
     try {
-      const url = `${GAMMA_MARKETS_ENDPOINT}?slug=${encodeURIComponent(
-        marketSlug,
-      )}`;
-
+      const url = `${GAMMA_MARKETS_ENDPOINT}?slug=${encodeURIComponent(marketSlug)}`;
       const response = await fetch(url);
-      if (!response.ok) {
-        this.logger.warn(
-          `fetchWinnerForMarket failed ${marketSlug}: ${response.status}`,
-        );
-        return null;
-      }
+      if (!response.ok) return null;
 
       const data: any = await response.json();
       const market = Array.isArray(data) ? data[0] : data;
-
       if (!market) return null;
 
       const candidates = [
@@ -709,12 +386,8 @@ export class OrderService {
         .map((v: any) => String(v).toLowerCase());
 
       for (const value of candidates) {
-        if (value.includes('up') || value === 'yes' || value === '1') {
-          return 'up';
-        }
-        if (value.includes('down') || value === 'no' || value === '0') {
-          return 'down';
-        }
+        if (value.includes('up') || value === 'yes' || value === '1') return 'up';
+        if (value.includes('down') || value === 'no' || value === '0') return 'down';
       }
 
       const outcomes = Array.isArray(market.outcomes)
@@ -727,16 +400,13 @@ export class OrderService {
         const name = String(
           outcome?.outcome ?? outcome?.name ?? outcome?.title ?? '',
         ).toLowerCase();
-
         const winnerFlag =
           outcome?.winner === true ||
           outcome?.won === true ||
-          (outcome?.resolved === true && outcome?.price === 1) ||
           outcome?.price === 1 ||
           outcome?.price === '1';
 
         if (!winnerFlag) continue;
-
         if (name.includes('up') || name === 'yes') return 'up';
         if (name.includes('down') || name === 'no') return 'down';
       }
@@ -748,7 +418,7 @@ export class OrderService {
     }
   }
 
-  private finalizeMarket(stats: MarketPaperStats, winner: OutcomeSide) {
+  private finalizeMarket(stats: MarketTradeStats, winner: OutcomeSide) {
     if (stats.settled) return;
 
     stats.settled = true;
@@ -757,16 +427,13 @@ export class OrderService {
 
     const upPayoutUsdc = winner === 'up' ? stats.upShares : 0;
     const downPayoutUsdc = winner === 'down' ? stats.downShares : 0;
-
     const totalCostUsdc = stats.upCostUsdc + stats.downCostUsdc;
     const totalPayoutUsdc = upPayoutUsdc + downPayoutUsdc;
     const netPnl = totalPayoutUsdc - totalCostUsdc;
-
     const winAmount =
       winner === 'up'
         ? upPayoutUsdc - stats.upCostUsdc
         : downPayoutUsdc - stats.downCostUsdc;
-
     const loseAmount = winner === 'up' ? stats.downCostUsdc : stats.upCostUsdc;
 
     this.appendMarketResultLog({
@@ -786,72 +453,30 @@ export class OrderService {
     });
 
     this.logger.log(
-      `[PAPER RESULT] ${stats.marketSlug} winner=${winner} upShares=${stats.upShares} downShares=${stats.downShares} upCost=${stats.upCostUsdc.toFixed(6)} downCost=${stats.downCostUsdc.toFixed(6)} netPnl=${netPnl.toFixed(6)}`,
+      `[RESULT] ${stats.marketSlug} winner=${winner} upShares=${stats.upShares.toFixed(6)} downShares=${stats.downShares.toFixed(6)} upCost=${stats.upCostUsdc.toFixed(6)} downCost=${stats.downCostUsdc.toFixed(6)} netPnl=${netPnl.toFixed(6)}`,
     );
   }
 
-  private isMarketable(params: {
-    side: Side;
-    price: number;
-    bestAsk?: number;
-    bestBid?: number;
-  }): boolean {
-    const { side, price, bestAsk, bestBid } = params;
+  // ── Token metadata ────────────────────────────────────────────────────────
 
-    if (side === Side.BUY) {
-      return bestAsk != null && !Number.isNaN(bestAsk) && bestAsk <= price;
-    }
-
-    if (side === Side.SELL) {
-      return bestBid != null && !Number.isNaN(bestBid) && bestBid >= price;
-    }
-
-    return false;
-  }
-
-  private resolveTokenMeta(tokenID: string):
-    | {
-        marketSlug: string;
-        conditionId: string;
-        outcome: OutcomeSide;
-      }
-    | null {
+  private resolveTokenMeta(
+    tokenID: string,
+  ): { marketSlug: string; conditionId: string; outcome: OutcomeSide } | null {
     for (const [marketSlug, pair] of TokenIdContext.entries()) {
       const conditionId = ConditionIdContext.get(marketSlug);
       if (!conditionId) continue;
-
-      if (pair?.up === tokenID) {
-        return { marketSlug, conditionId, outcome: 'up' };
-      }
-
-      if (pair?.down === tokenID) {
-        return { marketSlug, conditionId, outcome: 'down' };
-      }
+      if (pair?.up === tokenID) return { marketSlug, conditionId, outcome: 'up' };
+      if (pair?.down === tokenID) return { marketSlug, conditionId, outcome: 'down' };
     }
-
     return null;
   }
 
-  private toOpenOrder(order: FakeLiveOrder): OpenOrder {
-    return {
-      id: order.id,
-      market: order.market,
-      asset_id: order.tokenID,
-      price: order.price.toString(),
-      original_size: order.size.toString(),
-      size_matched: (order.size - order.remainingSize).toString(),
-      side: order.side,
-      outcome: order.outcome === 'up' ? 'Up' : 'Down',
-      status: 'LIVE',
-      created_at: order.createdAt,
-    } as unknown as OpenOrder;
-  }
+  // ── CSV helpers ───────────────────────────────────────────────────────────
 
   private ensureBaseLogFiles() {
     if (!fs.existsSync(this.logsDir)) {
       fs.mkdirSync(this.logsDir, { recursive: true });
     }
-
     if (!fs.existsSync(this.marketResultLogPath)) {
       const header =
         'ts,marketSlug,conditionId,winner,upShares,downShares,upCostUsdc,downCostUsdc,upPayoutUsdc,downPayoutUsdc,winAmount,loseAmount,netPnl\n';
@@ -863,23 +488,19 @@ export class OrderService {
     if (!fs.existsSync(this.logsDir)) {
       fs.mkdirSync(this.logsDir, { recursive: true });
     }
-
-    const tradeLogPath = this.getTradeLogPath(marketSlug);
-
-    if (!fs.existsSync(tradeLogPath)) {
+    const logPath = this.getTradeLogPath(marketSlug);
+    if (!fs.existsSync(logPath)) {
       const header =
-        'ts,event,marketSlug,conditionId,tokenId,outcome,side,orderPrice,size,bestBid,bestAsk,orderId,notes\n';
-      fs.writeFileSync(tradeLogPath, header, 'utf8');
+        'ts,event,marketSlug,conditionId,tokenId,outcome,side,orderPrice,size,orderId,notes\n';
+      fs.writeFileSync(logPath, header, 'utf8');
     }
   }
 
   private getTradeLogPath(marketSlug: string) {
-    const safeSlug = this.sanitizeForFilename(marketSlug);
-    return path.join(this.logsDir, `paper-trades-${safeSlug}.csv`);
-  }
-
-  private sanitizeForFilename(value: string) {
-    return value.replace(/[^a-zA-Z0-9._-]/g, '_');
+    return path.join(
+      this.logsDir,
+      `trades-${marketSlug.replace(/[^a-zA-Z0-9._-]/g, '_')}.csv`,
+    );
   }
 
   private appendTradeLog(
@@ -893,16 +514,12 @@ export class OrderService {
       side?: string;
       orderPrice?: number;
       size?: number;
-      bestBid?: number;
-      bestAsk?: number;
       orderId?: string;
       notes?: string;
     },
   ) {
     this.ensureTradeLogFile(marketSlug);
-
     const ts = (Date.now() / 1000).toFixed(3);
-
     const values = [
       ts,
       row.event ?? '',
@@ -911,14 +528,11 @@ export class OrderService {
       row.tokenId ?? '',
       row.outcome ?? '',
       row.side ?? '',
-      this.csvValue(row.orderPrice),
-      this.csvValue(row.size),
-      this.csvValue(row.bestBid),
-      this.csvValue(row.bestAsk),
+      this.csvVal(row.orderPrice),
+      this.csvVal(row.size),
       row.orderId ?? '',
       row.notes ?? '',
     ];
-
     fs.appendFileSync(
       this.getTradeLogPath(marketSlug),
       values.join(',') + '\n',
@@ -946,17 +560,16 @@ export class OrderService {
       row.marketSlug,
       row.conditionId,
       row.winner,
-      this.csvValue(row.upShares),
-      this.csvValue(row.downShares),
-      this.csvValue(row.upCostUsdc),
-      this.csvValue(row.downCostUsdc),
-      this.csvValue(row.upPayoutUsdc),
-      this.csvValue(row.downPayoutUsdc),
-      this.csvValue(row.winAmount),
-      this.csvValue(row.loseAmount),
-      this.csvValue(row.netPnl),
+      this.csvVal(row.upShares),
+      this.csvVal(row.downShares),
+      this.csvVal(row.upCostUsdc),
+      this.csvVal(row.downCostUsdc),
+      this.csvVal(row.upPayoutUsdc),
+      this.csvVal(row.downPayoutUsdc),
+      this.csvVal(row.winAmount),
+      this.csvVal(row.loseAmount),
+      this.csvVal(row.netPnl),
     ];
-
     fs.appendFileSync(
       this.marketResultLogPath,
       values.join(',') + '\n',
@@ -964,7 +577,7 @@ export class OrderService {
     );
   }
 
-  private csvValue(value?: number) {
+  private csvVal(value?: number) {
     if (value == null || Number.isNaN(value)) return '';
     return String(value);
   }
